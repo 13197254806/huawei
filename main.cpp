@@ -659,8 +659,8 @@ Page_* search_best_page(int disk_id)
 {
     /** 策略
      *  1. 磁头上个时间片的任务还没完成，则不允许去扫新的一页
-     *  2. 当前页已扫描的比例超过PAGE_PERCENT_THRESHOULD才允许切换到其它页
-     *  3. 收益率 = 目标页的权重之和 / (磁头从当前位置移动到目标页预期花费的令牌 + 扫描目标页花费的令牌 + 1)
+     *  2. 收益率 = 目标页的权重之和 / (磁头从当前位置移动到目标页预期花费的令牌 + 扫描目标页花费的令牌 + 1)
+     *
      */
     Page_* now_page = find_page_(disk_id, disk_point[disk_id]);
     Page_* res = now_page;
@@ -686,8 +686,10 @@ Page_* search_best_page(int disk_id)
         Page_ *p = &pages[disk_id][i];
         float sum_weights = 0;
         // 选择磁头直接跳到页首，还是一格一格移过去
-        int sum_tokens = std::min(G, ((p -> position - disk_point[disk_id] + V) % V) * pass_cost_());
-        int position = p -> position;
+        // int position = p -> position;
+        // int sum_tokens = std::min(G, ((p -> position - disk_point[disk_id] + V) % V) * pass_cost_());
+        int position = p == now_page? disk_point[disk_id]: p -> position;
+        int sum_tokens = std::min(G, ((position - disk_point[disk_id] + V) % V) * pass_cost_());
         int tokens_origin = 1e9, tokens = 1e9;
 
         for(int j = position; j <= p -> position + p -> page_size; j ++)
