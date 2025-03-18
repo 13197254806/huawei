@@ -37,7 +37,7 @@
 // 权重阈值，如果当前块的权重比该值低就不读了，直接跳过
 #define WEIGHT_THRESHOULD (1 * REP_NUM)
 // 阈值gamma，当该页的剩余部分平均收益小于前面部分平均收益的gamma倍时，把该磁头的状态标记为已完成
-#define EARLY_STOP_THRESHOULD (0.1)
+#define EARLY_STOP_THRESHOULD (0.2)
 // 窗口尺寸，作为贪心策略的参数，决定是否要读当前对象块，或是pass （调参发现等于9时效果最好）
 #define WINDOW_SIZE (9)
 // 随机数种子，设置为0代表使用当前系统时间
@@ -296,13 +296,7 @@ void init()
     printf("OK\n");
     fflush(stdout);
     // 初始化随机种子
-    if (RANDOM_SEED == 0)
-    {
-        std::srand(std::time(0));
-    }else
-    {
-        std::srand(RANDOM_SEED);
-    }
+    std::srand(RANDOM_SEED);
 
     // 参数自适应初始化
     JUMP_COST = G;
