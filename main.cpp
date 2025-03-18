@@ -94,6 +94,92 @@ struct Page_
     }
 };
 
+// 定义链表节点
+typedef struct Node_ {
+    int request_id;
+    Node_ *prev;
+    Node_ *next;
+    Node_() = default;
+    explicit  Node_(int _request_id): request_id(_request_id), prev(nullptr), next(nullptr){}
+}Node;
+
+// 定义双向链表
+class Deque
+{
+public:
+    // 头节点和尾节点均为空节点，不保存数据
+    Node_ *head;
+    Node_ *tail;
+    // 定义从请求id到链表节点指针的映射，实现O(1)删除
+    Node_ **mp;
+    int cnt;
+
+    Deque()
+    {
+        this -> head = new Node_();
+        this -> tail = new Node_();
+        this -> head -> next = this -> tail;
+        this -> tail -> prev = this -> head;
+        this -> mp = new Node_*[MAX_REQUEST_NUM]();
+        this -> cnt = 0;
+    }
+
+    // 删除request_id的节点
+    void erase(int request_id)
+    {
+        if (mp[request_id] == nullptr)
+        {
+            return;
+        }
+        Node_ *p = mp[request_id];
+        Node_ *prev = p -> prev, *next = p -> next;
+        prev -> next = next;
+        next -> prev = prev;
+        mp[request_id] = nullptr;
+
+        this -> cnt --;
+    };
+
+    // 插入链表尾部
+    void append(int request_id)
+    {
+        mp[request_id] = new Node_(request_id);
+        Node_ *p = mp[request_id], *prev = tail -> prev;
+
+        prev -> next = p;
+        p -> prev = prev;
+        p -> next = this -> tail;
+        this -> tail -> prev = p;
+
+        this -> cnt ++;
+    }
+
+    // 获取链表头的request_id
+    int front()
+    {
+        Node_ *front = this -> head -> next;
+        return front -> request_id;
+    }
+
+    // 弹出链表头节点
+    void pop_front()
+    {
+        Node_ *front = this -> head -> next;
+        Node_ *next = front -> next;
+        this -> head -> next = next;
+        next -> prev = this -> head;
+
+        mp[front -> request_id] = nullptr;
+
+        this -> cnt --;
+    }
+
+    int size()
+    {
+        return this -> cnt;
+    }
+
+};
 
 /**
  *
@@ -140,7 +226,7 @@ int weights[MAX_DISK_NUM][MAX_DISK_SIZE];
 // 维护当前时间片中，磁盘i中所有块是否被取出
 int visited[MAX_DISK_NUM][MAX_DISK_SIZE];
 // 未完成且仍有效的读请求列表 (status均为0)
-std::deque<Request*> unfinished;
+Deque unfinished = Deque();
 // 维护所有请求的完成状态 (0:还未完成, 1:已完成)
 bool request_finished[MAX_REQUEST_NUM];
 // 维护所有请求的删除状态 (0:未删除, 1:已删除)
@@ -148,6 +234,16 @@ bool request_deleted[MAX_REQUEST_NUM];
 // 当前时间片的磁头移动情况
 std::string result[MAX_DISK_NUM];
 
+
+/**
+ *  每一轮都需要初始化的变量
+ */
+// 每轮被删除的对象id列表
+std::vector<int> deleted_object_ids;
+// 每轮新增加的请求列表
+std::vector<int> added_request_ids;
+// 每轮完成的请求
+std::vector<int> finished_request_ids;
 
 
 // 初始化
@@ -176,7 +272,7 @@ void init()
     // 部分参数初始化
     JUMP_COST = G;
     PASS_COST = 1;
-    PAGE_SIZE = (G + 15) / 16 + 10;
+    // PAGE_SIZE = (G + 15) / 16 + 10;
     PAGE_SIZE = std::min(V, PAGE_SIZE);
     PAGE_NUM = (V + PAGE_SIZE - 1) / PAGE_SIZE;
 
@@ -198,29 +294,39 @@ void init()
     }
 }
 
-// 更新unfinished环形队列
-void update_unfinished(std::vector<Request*> &added)
+void init_per_timestamp()
 {
-    // 添加这一时间片中新增的读请求
-    for(Request *r: added)
+    deleted_object_ids.clear();
+    added_request_ids.clear();
+    finished_request_ids.clear();
+}
+
+
+// 更新unfinished
+void update_unfinished()
+{
+
+    // 新增的Request
+    for(int request_id: added_request_ids)
     {
-        unfinished.push_back(r);
+
+        unfinished.append(request_id);
     }
-
-    // 删除队列中非法的读请求
-    int queue_size = (int)unfinished.size();
-    for (int i = 1; i <= queue_size; i ++)
+    // 过期的Request
+    while (unfinished.size() > 0 && (now_time - request[unfinished.front()].timestamp > MAX_ALIVE))
     {
-        Request *r = unfinished.front();
         unfinished.pop_front();
-
-        if ((now_time - r -> timestamp < MAX_ALIVE) && (! request_deleted[r -> id]) && (! request_finished[r -> id]))
+    }
+    // 被删除的Object绑定的Request
+    for (int object_id: deleted_object_ids)
+    {
+        int request_id = object[object_id].last_request_point;
+        while (request_id > 0)
         {
-            // 如果r没过期，并且没被删除和完成，则重新入队
-            unfinished.push_back(r);
+            unfinished.erase(request_id);
+            request_id = request[request_id].prev_id;
         }
     }
-
 }
 
 void printDisks(){
@@ -284,13 +390,6 @@ void timestamp_action()
     fflush(stdout);
 }
 
-// void do_object_delete(const int* object_unit, int* disk_unit, int size)
-// {
-//     for (int i = 1; i <= size; i++) {
-//         disk_unit[object_unit[i]] = 0;
-//     }
-// }
-
 // 删除obj，维护obj的相关信息
 void do_object_delete(Object *obj)
 {
@@ -347,7 +446,6 @@ void do_object_delete(Object *obj)
                 }
             }
 
-
             // // 更新obj （这一步其实可以省略，因为这个对象后续不会再用上）
             // obj -> unit[i][j] = 0;
         }
@@ -364,12 +462,11 @@ void delete_action()
     int n_delete;
     int abort_num = 0;
     static int _id[MAX_OBJECT_NUM];
-    std::vector<int> deleted_objects_ids;
 
     scanf("%d", &n_delete);
     for (int i = 1; i <= n_delete; i++) {
         scanf("%d", &_id[i]);
-        deleted_objects_ids.push_back(_id[i]);
+        deleted_object_ids.push_back(_id[i]);
     }
 
     for (int i = 1; i <= n_delete; i++) {
@@ -771,7 +868,7 @@ bool update_request(Request *r)
 }
 
 // 1个时间片内，移动所有磁头，返回已完成的请求列表
-std::vector<Request*> do_objects_read()
+void do_objects_read()
 {
     /** 1. 初始化
      *  2. 计算每个磁盘，每个块的权重
@@ -780,7 +877,6 @@ std::vector<Request*> do_objects_read()
      *  5. 更新状态信息
      *  6. 统计读取结果
      */
-    std::vector<Request*> finished;
     for (int i = 1; i <= N; i ++)
     {
         result[i].clear();
@@ -792,9 +888,9 @@ std::vector<Request*> do_objects_read()
     }
 
     // 遍历每个已有请求，贡献权重
-    for (Request *r: unfinished)
+    for (Node_ *p = unfinished.head ->next; p != unfinished.tail; p = p -> next)
     {
-        add_weights(r);
+        add_weights(&request[p -> request_id]);
     }
 
     // 移动各个磁头
@@ -849,23 +945,20 @@ std::vector<Request*> do_objects_read()
         }
     }
 
+    
     // 把unfinished队列的每个请求拿出来，检查是否完成
-    int count_unfinished = (int)unfinished.size();
-    for (int i = 1; i <= count_unfinished; i ++)
+    for (Node_ *p = unfinished.tail -> prev; p != unfinished.head; p = p -> prev)
     {
-        Request *r = unfinished.front();
-        unfinished.pop_front();
-
+        Request_ *r = &request[p -> request_id];
         if (update_request(r))
         {
-            finished.push_back(r);
-        } else
-        {
-            unfinished.push_back(r);
+            finished_request_ids.push_back(r -> id);
         }
     }
-
-    return finished;
+    for (int request_id: finished_request_ids)
+    {
+        unfinished.erase(request_id);
+    }
 }
 
 
@@ -874,7 +967,6 @@ void read_action()
     int n_read;
     int request_id, object_id;
     // 这一轮新增的Request
-    std::vector<Request*> added;
 
     scanf("%d", &n_read);
     for (int i = 1; i <= n_read; i++) {
@@ -885,13 +977,14 @@ void read_action()
         request[request_id].timestamp = now_time;
         object[object_id].last_request_point = request_id;
 
-        added.push_back(&request[request_id]);
+        added_request_ids.push_back(request_id);
     }
 
     // 更新unfinished队列
-    update_unfinished(added);
-    // 在这一时间片上移动指针
-    std::vector<Request*> finished = do_objects_read();
+    update_unfinished();
+
+    // 在这一时间片上完成读操作
+    do_objects_read();
 
     // 上报所有已完成的请求
     for (int i = 1; i <= N; i++) {
@@ -901,10 +994,10 @@ void read_action()
         }
         printf("%s\n", result[i].c_str());
     }
-    printf("%d\n", (int)finished.size());
-    for (Request* r: finished)
+    printf("%d\n", (int)finished_request_ids.size());
+    for (int _request_id: finished_request_ids)
     {
-        printf("%d\n", (int)r -> id);
+        printf("%d\n", _request_id);
     }
     fflush(stdout);
 }
@@ -927,6 +1020,8 @@ int main()
 
     for (now_time = 1; now_time <= T + EXTRA_TIME; now_time++) {
         timestamp_action();
+
+        init_per_timestamp();
         delete_action();
         write_action();
         read_action();
