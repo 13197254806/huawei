@@ -2,3 +2,5 @@
 .idea
 
 main
+main.cpp -run
+main.cpp:tests

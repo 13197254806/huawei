@@ -20,25 +20,28 @@
 #define FRE_PER_SLICING (1800)
 #define EXTRA_TIME (105)
 
-// 最大的类型数量
+// 最大的对象类型数量
 #define MAX_M (16 + 1)
 // 对象包含的最大对象块数量
 #define MAX_BLOCKS (5 + 1)
 // 最大的时间片数量
 #define MAX_TIME (86400 + 1)
-// 最大的页数（等于磁盘大小）
+// 最大的页数（等于磁盘大小，这时页大小为1）
 #define MAX_PAGE_NUM (MAX_DISK_SIZE)
-// 写入一个对象时的最大重试次数
+// 最大重试次数（调试用）
 #define MAX_RETRY (100)
-// 一个读请求最多存活的时间片数量
-#define MAX_ALIVE (105)
-// 默认页大小
-#define DEFAULT_PAGE_SIZE (200)
+// 一个读请求的最长存活时间，可以控制代码运行时间 (最大取105)
+#define MAX_ALIVE (80)
+// 默认页大小（不是最终的页大小，init里还需要自适应计算）
+#define DEFAULT_PAGE_SIZE (500)
 // 权重阈值，如果当前块的权重比该值低就不读了，直接跳过
-// #define WEIGHT_THRESHOULD (0.001 * REP_NUM)
-#define WEIGHT_THRESHOULD (1)
-// 页切换阈值，当前页扫描过的比例超过这个阈值，才允许切到其它页
-#define PAGE_PERCENT_THRESHOULD (0.8)
+#define WEIGHT_THRESHOULD (1 * REP_NUM)
+// 阈值gamma，当该页的剩余部分平均收益小于前面部分平均收益的gamma倍时，把该磁头的状态标记为已完成
+#define EARLY_STOP_THRESHOULD (0.1)
+// 窗口尺寸，作为贪心策略的参数，决定是否要读当前对象块，或是pass （调参发现等于9时效果最好）
+#define WINDOW_SIZE (9)
+// 随机数种子，设置为0代表使用当前系统时间
+#define RANDOM_SEED (114514)
 
 // 定义读请求
 typedef struct Request_ {
@@ -60,6 +63,7 @@ typedef struct Object_ {
     int last_request_point;
     bool is_delete;
 
+    // 对象id
     int id;
     // 排序规则
     bool friend operator <(const Object_ &aa, const Object_ &bb)
@@ -71,14 +75,14 @@ typedef struct Object_ {
 // 定义页结构
 struct Page_
 {
-    int disk_id = 0;    // 所在磁盘的id
-    int position = 0;   // 在磁盘中的位置 (1 ～ V)
-    int page_size = 0;  // 实际页大小
-    int page_index = 0; // 实际页号（从1开始）
-    int usable_size = 0;    //剩余存储空间
+    int disk_id = 0;        // 所在磁盘的id
+    int position = 0;       // 第一个块在磁盘中的位置 (1 ~ V)
+    int page_size = 0;      // 实际页大小
+    int page_index = 0;     // 实际页号（1 ~ PAGE_NUM)
+    int usable_size = 0;    // 剩余可用空间
     int cnt[MAX_M] = {0};   // 各个类型的对象块数量
-    int max_cnt = 0;  //占比最高的类型所占比例 (0 ~ 1)
-    int max_tag = 0;    //占比最高的类型 (1 ~ V)
+    int max_cnt = 0;        // 占比最高的对象块类型数量 (1 ~ page_size)
+    int max_tag = 0;        // 占比最高的对象块类型 (1 ~ V)
     Page_() = default;
     Page_(int _disk_id, int _page_index):
         disk_id(_disk_id), page_index(_page_index) {}
@@ -96,6 +100,7 @@ struct Page_
 
 // 定义链表节点
 typedef struct Node_ {
+    // 请求id
     int request_id;
     Node_ *prev;
     Node_ *next;
@@ -107,11 +112,12 @@ typedef struct Node_ {
 class Deque
 {
 public:
-    // 头节点和尾节点均为空节点，不保存数据
+    // 头节点和尾节点均不保存数据
     Node_ *head;
     Node_ *tail;
     // 定义从请求id到链表节点指针的映射，实现O(1)删除
     Node_ **mp;
+    // 节点数量（不含头、尾节点）
     int cnt;
 
     Deque()
@@ -140,7 +146,7 @@ public:
         this -> cnt --;
     };
 
-    // 插入链表尾部
+    // 插入表尾部
     void append(int request_id)
     {
         mp[request_id] = new Node_(request_id);
@@ -154,14 +160,14 @@ public:
         this -> cnt ++;
     }
 
-    // 获取链表头的request_id
+    // 获取表头节点的request_id
     int front()
     {
         Node_ *front = this -> head -> next;
         return front -> request_id;
     }
 
-    // 弹出链表头节点
+    // 弹出表头节点
     void pop_front()
     {
         Node_ *front = this -> head -> next;
@@ -181,13 +187,16 @@ public:
 
 };
 
+
 /**
  *
- *  全局变量
+ *  需要全局维护的变量
  *
  */
-
 int T, M, N, V, G;
+/**
+ *  TODO: 还没使用统计信息
+ */
 int fre_del[MAX_M][(MAX_TIME + FRE_PER_SLICING - 1) / FRE_PER_SLICING];
 int fre_write[MAX_M][(MAX_TIME + FRE_PER_SLICING - 1) / FRE_PER_SLICING];
 int fre_read[MAX_M][(MAX_TIME + FRE_PER_SLICING - 1) / FRE_PER_SLICING];
@@ -195,61 +204,79 @@ Request request[MAX_REQUEST_NUM];
 Object object[MAX_OBJECT_NUM];
 int now_time;
 
-// 一个磁盘划分的页的数量
+// 一个磁盘划分的页数量
 int PAGE_NUM;
-// 预设的页大小（每个磁盘最后一页的大小可能不等于PAGE_SIZE）
+// 页大小（每个磁盘最后一页的大小可能不等于PAGE_SIZE）
 int PAGE_SIZE = DEFAULT_PAGE_SIZE;
 // 磁盘存储状态
 int disk[MAX_DISK_NUM][MAX_DISK_SIZE];
 // 磁头当前位置
 int disk_point[MAX_DISK_NUM];
-// 磁头当前的状态 (k>0: 磁头已经连续读了k次, k=0: 磁头上次pass了, k<0: 磁头上次是jump过来的)
+// 磁头当前的状态 (k>0: 磁头已经连续读了k次, k=0: 磁头上次pass了, k=-1: 磁头上次是jump过来的)
 int disk_point_last_status[MAX_DISK_NUM];
 // 磁头上次消耗的令牌数
 int disk_point_last_cost[MAX_DISK_NUM];
 // 磁头上个时间片是否读完了它的目标页
 bool disk_point_last_done[MAX_DISK_NUM];
-// 每个磁盘的剩余空间
+// 每个磁盘的剩余可用空间
 int usable_capacy[MAX_DISK_NUM];
 
-// JUMP消耗的令牌数
+// 一次JUMP消耗的令牌数
 int JUMP_COST;
-// PASS消耗的令牌数
+// 一次PASS消耗的令牌数
 int PASS_COST;
+
+// 允许的最大unfinished大小，可以控制代码运行时间
+int MAX_DEQUE_SIZE;
 
 // 维护磁盘i中第j个页
 Page_ pages[MAX_DISK_NUM][MAX_PAGE_NUM];
-// 维护磁盘i中最大类型为j的，非空且非满的页号
+// 维护磁盘i中主要对象块类型为j，非空且非满的页号
 std::set<int> st[MAX_DISK_NUM][MAX_M];
-// 维护磁盘i中所有块的权重
-int weights[MAX_DISK_NUM][MAX_DISK_SIZE];
-// 维护当前时间片中，磁盘i中所有块是否被取出
-int visited[MAX_DISK_NUM][MAX_DISK_SIZE];
-// 未完成且仍有效的读请求列表 (status均为0)
+// 维护当前仍有效的读请求
 Deque unfinished = Deque();
-// 维护所有请求的完成状态 (0:还未完成, 1:已完成)
+// 维护历史所有请求的完成状态 (0:未完成, 1:已完成)
 bool request_finished[MAX_REQUEST_NUM];
-// 维护所有请求的删除状态 (0:未删除, 1:已删除)
+// 维护历史所有请求的删除状态 (0:未删除, 1:已删除)
 bool request_deleted[MAX_REQUEST_NUM];
-// 当前时间片的磁头移动情况
-std::string result[MAX_DISK_NUM];
 
 
 /**
- *  每一轮都需要初始化的变量
+ *
+ *  需要每个时间片都初始化的变量
+ *
  */
-// 每轮被删除的对象id列表
+// 维护磁盘i中第j块的权重
+int weights[MAX_DISK_NUM][MAX_DISK_SIZE];
+// 权重的前缀和
+int s_weights[MAX_DISK_NUM][MAX_DISK_SIZE];
+// // 期望的令牌消耗量前缀和
+// int s_expected_tokens[MAX_DISK_NUM][MAX_DISK_SIZE];
+// 维护磁盘i中第j块，在当前时间片是否被读出来
+int visited[MAX_DISK_NUM][MAX_DISK_SIZE];
+
+// 每个时间片删除的对象id列表
 std::vector<int> deleted_object_ids;
-// 每轮新增加的请求列表
+// 每个时间片新增的对象id列表
+std::vector<int> added_object_ids;
+// 每个时间片新增的请求id列表
 std::vector<int> added_request_ids;
-// 每轮完成的请求
+// 每个时间片完成的请求id列表
 std::vector<int> finished_request_ids;
+// 当前时间片的磁头移动结果 (用于输出)
+std::string result[MAX_DISK_NUM];
 
 
-// 初始化
+
+
+/**
+ *
+ *  工具函数
+ *
+ */
+// 预输入与全局初始化
 void init()
 {
-    // 预输入
     scanf("%d%d%d%d%d", &T, &M, &N, &V, &G);
     for (int i = 1; i <= M; i++) {
         for (int j = 1; j <= (T - 1) / FRE_PER_SLICING + 1; j++) {
@@ -268,13 +295,22 @@ void init()
     }
     printf("OK\n");
     fflush(stdout);
+    // 初始化随机种子
+    if (RANDOM_SEED == 0)
+    {
+        std::srand(std::time(0));
+    }else
+    {
+        std::srand(RANDOM_SEED);
+    }
 
-    // 部分参数初始化
+    // 参数自适应初始化
     JUMP_COST = G;
     PASS_COST = 1;
-    // PAGE_SIZE = (G + 15) / 16 + 10;
     PAGE_SIZE = std::min(V, PAGE_SIZE);
+    PAGE_SIZE = std::max(PAGE_SIZE, V / 16);
     PAGE_NUM = (V + PAGE_SIZE - 1) / PAGE_SIZE;
+    MAX_DEQUE_SIZE = std::max(G / 16 / 1 * N * 50, 1);
 
     // 初始化磁头位置
     for (int i = 1; i <= N; i++) {
@@ -294,30 +330,46 @@ void init()
     }
 }
 
+// 每个时间片的初始化
 void init_per_timestamp()
 {
+    added_object_ids.clear();
     deleted_object_ids.clear();
     added_request_ids.clear();
     finished_request_ids.clear();
+
+    for (int i = 1; i <= N; i ++)
+    {
+        result[i].clear();
+        for (int j = 1; j <= V; j ++)
+        {
+            weights[i][j] = 0;
+            visited[i][j] = 0;
+        }
+    }
 }
 
-
-// 更新unfinished
+// 更新unfinished链表
 void update_unfinished()
 {
-
     // 新增的Request
     for(int request_id: added_request_ids)
     {
 
         unfinished.append(request_id);
     }
+
+    // 控制unfinished大小
+    while (unfinished.size() > MAX_DEQUE_SIZE)
+    {
+        unfinished.pop_front();
+    }
     // 过期的Request
     while (unfinished.size() > 0 && (now_time - request[unfinished.front()].timestamp > MAX_ALIVE))
     {
         unfinished.pop_front();
     }
-    // 被删除的Object绑定的Request
+    // 删除的Object绑定的Request
     for (int object_id: deleted_object_ids)
     {
         int request_id = object[object_id].last_request_point;
@@ -339,6 +391,7 @@ void printDisks(){
     }
 }
 
+// 打分（int代替，乘了1000倍）
 int time_decay(int timestamp){
     int delta = now_time - timestamp;
     if (delta <= 10)    return -5 * delta + 1000;
@@ -346,7 +399,7 @@ int time_decay(int timestamp){
     return 0;
 }
 
-// 返回磁盘上某一位置对应的页
+// 返回磁盘disk_id上position对应的页
 Page_* find_page_(int disk_id, int position)
 {
     return &pages[disk_id][(position - 1) / PAGE_SIZE + 1];
@@ -365,22 +418,21 @@ int find_now_slice_()
     return (now_time + FRE_PER_SLICING - 1) / FRE_PER_SLICING + 1;
 }
 
-// 磁头读一个块的令牌消耗
+// 根据磁头上一次的动作和令牌消耗，确定磁头这次读一个块的令牌消耗
 int read_cost_(int last_status, int last_cost)
 {
     /** 根据磁头上一时刻的状态和令牌消耗量计算
      */
-    int cost;
-    if (last_status <= 0)
-    {
-        cost = 64;
-    } else
-    {
-        cost = std::max(16, (int)std::ceil(0.8 * last_cost));
-    }
-    return cost;
+    return last_status <= 0 ? 64 : std::max(16, (int)std::ceil(0.8 * last_cost));
 }
 
+
+
+/**
+ *
+ *  时间片对齐事件
+ *
+ */
 void timestamp_action()
 {
     int timestamp;
@@ -390,6 +442,13 @@ void timestamp_action()
     fflush(stdout);
 }
 
+
+
+/**
+ *
+ *  删除事件
+ *
+ */
 // 删除obj，维护obj的相关信息
 void do_object_delete(Object *obj)
 {
@@ -445,7 +504,6 @@ void do_object_delete(Object *obj)
                     }
                 }
             }
-
             // // 更新obj （这一步其实可以省略，因为这个对象后续不会再用上）
             // obj -> unit[i][j] = 0;
         }
@@ -500,10 +558,17 @@ void delete_action()
     fflush(stdout);
 }
 
+
+
+/**
+ *
+ *  写事件
+ *
+ */
 // 把对象obj的第rep_idx个副本写进磁盘disk_id，并更新存储信息和页信息（自动找到最合适的写入位置，调用函数前保证一定有足够空间）
 void object_write_(Object *obj, int disk_id, int rep_idx)
 {
-    /** 1. 找到最合适的存储位置
+    /** 1. 找到合适的写入位置
      *  2. 写入对象，更新存储信息disk
      *  3. 更新对象信息obj
      *  4. 更新页信息pages
@@ -533,11 +598,11 @@ void object_write_(Object *obj, int disk_id, int rep_idx)
         {
             Page_ *p_max_usable = nullptr;
             int max_usable_size = -1;
-            // 没找到，遍历所有空页，在所有空页中找到第一个
-            /** TODO: 策略改进点
-             *  1. 优先找到附近有max_tag相同的满页，且距离最近的空页
-             *  2. 如果没有符合1的空页，则遍历找到cnt[tag]最大且非0的页 (从后往前写)
-             *  3. 如果没有符合2的空页，则遍历找到usable_size最大的页 (从后往前写)
+            /** TODO: 策略需要改进（目前代码只实现了1）
+             *  1. 优先找到max_tag相同的非空非满页
+             *  2. 如果没有符合1的页，找到附近有相同max_tag，且距离最近的空页
+             *  3. 如果没有符合2的空页，则遍历找到cnt[tag]最大且非0的页
+             *  4. 如果没有符合3的空页，则遍历找到usable_size最大的页
              */
             for (int i = 1; i <= PAGE_NUM; i ++)
             {
@@ -593,19 +658,20 @@ void object_write_(Object *obj, int disk_id, int rep_idx)
     }
 }
 
-// 写多个对象
-void do_objects_write(std::vector<Object*> &objects)
+// 写这个时间片的全部对象
+void do_objects_write()
 {
     /** 写策略
      *  1. 随机选择3个硬盘
      *  2. 将每一个对象obj写入这3个硬盘disk[1: 3]
-     *      2.1 obj在硬盘disk[i]上，自适应地找到最合适它的写入位置
+     *      2.1 obj在硬盘disk[i]上找到最合适它的写入位置
      *      2.2 更新obj在第i个硬盘上的存储信息、页信息
      *  3. 完成
      */
 
-    for (Object *obj: objects)
+    for (int object_id: added_object_ids)
     {
+        Object *obj = &object[object_id];
         int count_retry = 0;
         std::vector<bool> bit_map(N + 1, false);
         for (int i = 1; i <= REP_NUM; i ++)
@@ -634,7 +700,6 @@ void write_action()
     int n_write;
     scanf("%d", &n_write);
     // 同一次写请求中的对象先暂存起来，排序后再写
-    std::vector<Object*> tmp;
 
     for (int i = 1; i <= n_write; i++) {
         int id, size, tag;
@@ -644,14 +709,14 @@ void write_action()
         object[id].tag = tag;
         object[id].is_delete = false;
         object[id].id = id;
-        tmp.push_back(&object[id]);
+        added_object_ids.push_back(id);
     }
 
     // 批量写入
-    do_objects_write(tmp);
+    do_objects_write();
 
-    for (Object *obj: tmp) {
-        int id = obj -> id, size = obj -> size;
+    for (int id: added_object_ids) {
+        int size = object[id].size;
 
         printf("%d\n", id);
         for (int j = 1; j <= REP_NUM; j++) {
@@ -667,14 +732,15 @@ void write_action()
 }
 
 
-// 利用r给相关的块添加权重
+
+/**
+ *
+ *  读事件
+ *
+ */
+// 给r还未完成的块添加权重
 void add_weights(Request *r)
 {
-    /** 当前读请求r对相关块的权重贡献
-     *  每个未读对象块(disk_id, position)的贡献 = 时间衰减系数 * 1
-     *  时间衰减系数 = (now_time - obj.timestamp) / MAX_ALIVE
-     */
-
     Object *obj = &object[r -> object_id];
     for (int i = 1; i <= REP_NUM; i ++)
     {
@@ -692,50 +758,85 @@ void add_weights(Request *r)
     }
 }
 
-// 给定状态的磁头，正位于(disk_id, position)，为了读到下一个有效块，下一步的最优行动方式
+// 给定状态的磁头，正位于(disk_id, position)，为了读到下一个有效块，找到下一步的最优行动方式
 int best_way_to_move(int last_status, int last_cost, int disk_id, int position, int &tokens)
 {
-    /** 比较两种策略，选择更优的一种，并且成功时扣减tokens
-     *  1. 保持当前读的状态，直到下一个有效块
-     *  2. 遇到无效块pass，直到下一个有效块才read
+    /**
+     *  策略: 当前块的读写操作，应当取决于接下来几个块（包括当前块）中，是否存在有效块。
+     *  理论推导：
+    *          假设当前位置是1，那么：
+     *              now_cost * (1 - 0.8^{k}) / (1 - 0.8) + 16 * (x - k) =
+     *              (x - 8) * PASS_COST + 64 * (1 - 0.8^{8}) / (1 - 0.8)
+     *
+     *          常数8等于从64每次乘0.8衰减到16所需的次数
+     *          x的含义是，接着一直读和先pass再读，这两种策略在第x轮的总花费相等
+     *          k的含义是，如果接着一直读，那么第k轮的令牌花费能降低到16
+     *          数值计算结果：
+     *              now_cost * (1 - 0.8^{k}) * 5 + 15 * x - 16 * k = 270
+     *              278 + 15x - 16 * 8 = 270   x=8.00
+     *              214 +15x - 16 * 7 = 270    x=11.20
+     *              162 +15x - 16 * 6 = 270    x=13.60
+     *              120 +15x - 16 * 5 = 270    x=15.33
+     *              86 +15x - 16 * 4 = 270     x=16.53
+     *              58 +15x - 16 * 3 = 270     x=17.33
+     *              35 +15x - 16 * 2 = 270     x=17.80
+     *              16 +15x - 16 * 1 = 270     x=18.00
+     *
+     *          那么最后一个需要读的块，至少应该出现在[1, 下取整x - WINDOW_SIZE + 1]（闭区间）。
+     *          计算过程中有取整，last_cost和k, x, 检查区间长度的对应关系是：
+     *               now_cost   k       x       区间长度
+     *                  64      8       23          1
+     *                  52      7       18          4
+     *                  42      6       12          6
+     *                  34      5       9           8
+     *                  28      4       8           9
+     *                  23      3       6           10
+     *                  19      2       3           10
+     *                  16      1       1           11
+     *          先带入k，再计算得到x，再看后面x个块的状态，决定是否改变
      *
      *  返回值
-     *      0:  下一步选择pass   扣减tokens
-     *      1:  下一步选择read   扣减tokens
+     *      0:  下一步选择pass   并扣减tokens
+     *      1:  下一步选择read   并扣减tokens
      *      -1: 令牌数不够
      */
-    if (tokens < PASS_COST)
+
+    // 理论最优的窗口大小
+    int length;
+    if (last_status <= 0)       length = 1;
+    else if (last_cost > 52)    length = 4;
+    else if (last_cost > 42)    length = 6;
+    else if (last_cost > 34)    length = 8;
+    else if (last_cost > 28)    length = 9;
+    else if (last_cost > 23)    length = 10;
+    else if (last_cost > 19)    length = 10;
+    else                        length = 11;
+
+
+    // 实际情况并不理想，因此设置为一个可调参数WINDOW_SIZE
+    // int length = WINDOW_SIZE;
+
+    if (tokens < PASS_COST) return -1;
+    int move_type;
+    int window_weight;
+    int end_position = (position + length - 1) % V + 1;
+    if (end_position <= position || length >= V)
     {
-        return -1;
-    }
-    static int max_steps = 8;
-    int read_sum_cost = 0, pass_sum_cost = 0;
-    int read_last_status = last_status, read_last_cost = last_cost;
-    int pass_last_status = last_status, pass_last_cost = last_cost;
-
-    for (int i = 1; i <= max_steps; i ++)
+        window_weight = s_weights[disk_id][V] - s_weights[disk_id][position - 1] + s_weights[disk_id][end_position];
+    }else
     {
-        if (weights[disk_id][position] >= WEIGHT_THRESHOULD)
-        {
-            read_last_cost = read_cost_(read_last_status, read_last_cost);
-            pass_last_cost = read_cost_(pass_last_status, pass_last_cost);
-
-            read_sum_cost += read_last_cost;
-            pass_sum_cost += pass_last_cost;
-            break;
-        }
-        read_last_cost = read_cost_(read_last_status, read_last_cost);
-        read_last_status = std::max(1, read_last_status + 1);
-        pass_last_cost = PASS_COST;
-        pass_last_status = 0;
-
-        read_sum_cost += last_cost;
-        pass_sum_cost += pass_last_cost;
-
-        position = (position + 1) % V + 1;
+        window_weight = s_weights[disk_id][end_position] - s_weights[disk_id][position - 1];
     }
 
-    if (read_sum_cost <= pass_sum_cost)
+    if (last_status <= 0)
+    {
+        move_type = weights[disk_id][position] >= WEIGHT_THRESHOULD ? 1: 0;
+    } else
+    {
+        move_type = window_weight > WEIGHT_THRESHOULD ? 1: 0;
+    }
+
+    if (move_type == 1)
     {
         if (tokens >= read_cost_(last_status, last_cost))
         {
@@ -754,7 +855,7 @@ Page_* search_best_page(int disk_id)
 {
     /** 策略
      *  1. 磁头上个时间片的任务还没完成，则不允许去扫新的一页
-     *  2. 收益率 = 目标页的权重之和 / (磁头从当前位置移动到目标页预期花费的令牌 + 扫描目标页花费的令牌 + 1)
+     *  2. 收益率 = 目标页的权重之和 / (磁头从当前位置移动到目标页预期花费的令牌 + 扫描目标页花费的令牌)
      *
      */
     Page_* now_page = find_page_(disk_id, disk_point[disk_id]);
@@ -784,12 +885,14 @@ Page_* search_best_page(int disk_id)
         // int position = p -> position;
         // int sum_tokens = std::min(G, ((p -> position - disk_point[disk_id] + V) % V) * PASS_COST);
         int position = p == now_page? disk_point[disk_id]: p -> position;
+        int end_position = p -> position + p -> page_size - 1;
         int sum_tokens = std::min(G, ((position - disk_point[disk_id] + V) % V) * PASS_COST);
         int tokens_origin = 1e9, tokens = 1e9;
 
-        for(int j = position; j <= p -> position + p -> page_size; j ++)
+        for(int j = position; j <= end_position; j ++)
         {
-            /*  TODO:当前策略需要优化
+            /**
+             *  TODO: 当前策略需要优化
              */
             int move_type = best_way_to_move(last_status, last_cost, disk_id, j, tokens);
             assert(move_type >= 0);
@@ -804,10 +907,22 @@ Page_* search_best_page(int disk_id)
                 last_status = std::max(1, last_status + 1);
                 sum_weights += weights[disk_id][j];
             }
+
+            // 如果剩余部分价值不高，则停止扫描
+            float profit_1 = (float)(s_weights[i][disk_point[i]] -  s_weights[i][position - 1]) / (float)(disk_point[i] - position + 1);
+            float profit_2 = (float)(s_weights[i][end_position] - s_weights[i][disk_point[i] - 1]) / (float)(end_position - disk_point[i] + 1);
+            if (profit_2 < profit_1 * EARLY_STOP_THRESHOULD)
+            {
+                break;
+            }
+
         }
+
+        // sum_weights += s_weights[disk_id][ending_position] - s_weights[disk_id][position - 1];
         sum_tokens += (tokens_origin - tokens);
         // float score = sum_weights / (static_cast<float>(sum_tokens) + 1);
         float score = static_cast<float>(sum_weights) / static_cast<float>(sum_tokens);
+        // float score = static_cast<float>(sum_weights);
         if (score > max_score)
         {
             max_score = score;
@@ -870,27 +985,28 @@ bool update_request(Request *r)
 // 1个时间片内，移动所有磁头，返回已完成的请求列表
 void do_objects_read()
 {
-    /** 1. 初始化
+    /**
+     *  TODO:优化策略
+     *  1. 初始化
      *  2. 计算每个磁盘，每个块的权重
      *  3. 每个磁盘上根据权重选出当前磁盘中最优的页
-     *  4. 根据策略移动磁头 (TODO:优化策略)
+     *  4. 根据策略移动磁头
      *  5. 更新状态信息
      *  6. 统计读取结果
      */
-    for (int i = 1; i <= N; i ++)
-    {
-        result[i].clear();
-        for (int j = 1; j <= V; j ++)
-        {
-            weights[i][j] = 0;
-            visited[i][j] = 0;
-        }
-    }
 
     // 遍历每个已有请求，贡献权重
     for (Node_ *p = unfinished.head ->next; p != unfinished.tail; p = p -> next)
     {
         add_weights(&request[p -> request_id]);
+    }
+    // 维护权重的前缀和
+    for (int i = 1; i <= N; i ++)
+    {
+        for (int j = 1; j <= V; j ++)
+        {
+            s_weights[i][j] = s_weights[i][j - 1] + weights[i][j];
+        }
     }
 
     // 移动各个磁头
@@ -901,7 +1017,7 @@ void do_objects_read()
         Page_ *now_page = find_page_(i, disk_point[i]);
         // 预期收益率最高的页 (如果上个时间片是跳转指令，那这个时间片扫描当前页就行了；否则去找一个最优的目标页)
         Page_ *best_page = search_best_page(i);
-        int position_ending = best_page -> position + best_page -> page_size - 1;
+        int end_position = best_page -> position + best_page -> page_size - 1;
 
         if (now_page != best_page)
         {
@@ -934,7 +1050,7 @@ void do_objects_read()
             if (move_type != -1)
             {
                 move_point(i, move_type);
-                if (disk_point[i] == position_ending)
+                if (disk_point[i] == end_position)
                 {
                     disk_point_last_done[i] = true;
                 }
@@ -942,6 +1058,19 @@ void do_objects_read()
             {
                 break;
             }
+        }
+
+        /**
+         *  优化：
+         *      如果当前页剩下部分收益不高，就把disk_point_last_done[i]置为1，这样该磁头下一轮就有机会跳出该页
+         */
+        now_page = find_page_(i, disk_point[i]);
+        int left = now_page -> position, right = now_page -> position + now_page -> page_size - 1;
+        float profit_1 = (float)(s_weights[i][disk_point[i]] -  s_weights[i][left - 1]) / (float)(disk_point[i] - left + 1);
+        float profit_2 = (float)(s_weights[i][right] - s_weights[i][disk_point[i] - 1]) / (float)(right - disk_point[i] + 1);
+        if (profit_2 < profit_1 * EARLY_STOP_THRESHOULD)
+        {
+            disk_point_last_done[i] = true;
         }
     }
 
@@ -966,7 +1095,6 @@ void read_action()
 {
     int n_read;
     int request_id, object_id;
-    // 这一轮新增的Request
 
     scanf("%d", &n_read);
     for (int i = 1; i <= n_read; i++) {
