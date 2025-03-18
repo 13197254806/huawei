@@ -35,7 +35,8 @@
 // 默认页大小
 #define DEFAULT_PAGE_SIZE (200)
 // 权重阈值，如果当前块的权重比该值低就不读了，直接跳过
-#define WEIGHT_THRESHOULD (0.01)
+// #define WEIGHT_THRESHOULD (0.001 * REP_NUM)
+#define WEIGHT_THRESHOULD (1)
 // 页切换阈值，当前页扫描过的比例超过这个阈值，才允许切到其它页
 #define PAGE_PERCENT_THRESHOULD (0.8)
 
@@ -111,7 +112,7 @@ int now_time;
 // 一个磁盘划分的页的数量
 int PAGE_NUM;
 // 预设的页大小（每个磁盘最后一页的大小可能不等于PAGE_SIZE）
-int PAGE_SIZE;
+int PAGE_SIZE = DEFAULT_PAGE_SIZE;
 // 磁盘存储状态
 int disk[MAX_DISK_NUM][MAX_DISK_SIZE];
 // 磁头当前位置
@@ -125,12 +126,17 @@ bool disk_point_last_done[MAX_DISK_NUM];
 // 每个磁盘的剩余空间
 int usable_capacy[MAX_DISK_NUM];
 
+// JUMP消耗的令牌数
+int JUMP_COST;
+// PASS消耗的令牌数
+int PASS_COST;
+
 // 维护磁盘i中第j个页
 Page_ pages[MAX_DISK_NUM][MAX_PAGE_NUM];
 // 维护磁盘i中最大类型为j的，非空且非满的页号
 std::set<int> st[MAX_DISK_NUM][MAX_M];
 // 维护磁盘i中所有块的权重
-float weights[MAX_DISK_NUM][MAX_DISK_SIZE];
+int weights[MAX_DISK_NUM][MAX_DISK_SIZE];
 // 维护当前时间片中，磁盘i中所有块是否被取出
 int visited[MAX_DISK_NUM][MAX_DISK_SIZE];
 // 未完成且仍有效的读请求列表 (status均为0)
@@ -167,14 +173,19 @@ void init()
     printf("OK\n");
     fflush(stdout);
 
+    // 部分参数初始化
+    JUMP_COST = G;
+    PASS_COST = 1;
+    PAGE_SIZE = (G + 15) / 16 + 10;
+    PAGE_SIZE = std::min(V, PAGE_SIZE);
+    PAGE_NUM = (V + PAGE_SIZE - 1) / PAGE_SIZE;
+
     // 初始化磁头位置
     for (int i = 1; i <= N; i++) {
         disk_point[i] = 1;
         disk_point_last_done[i] = 1;
     }
     // 初始化页表
-    PAGE_SIZE = std::min(V, DEFAULT_PAGE_SIZE);
-    PAGE_NUM = (V + PAGE_SIZE - 1) / PAGE_SIZE;
     for (int i = 1; i <= N; i ++)
     {
         for (int j = 1; j <= PAGE_NUM; j ++)
@@ -222,10 +233,10 @@ void printDisks(){
     }
 }
 
-float time_decay(int timestamp){
-    auto delta = static_cast<float>(now_time - timestamp);
-    if (delta <= 10)    return -0.005 * delta + 1;
-    if (delta <= 105)   return -0.01 * delta + 1.05;
+int time_decay(int timestamp){
+    int delta = now_time - timestamp;
+    if (delta <= 10)    return -5 * delta + 1000;
+    if (delta <= 105)   return -10* delta + 1050;
     return 0;
 }
 
@@ -263,19 +274,6 @@ int read_cost_(int last_status, int last_cost)
     }
     return cost;
 }
-
-// 磁头经过一个块的令牌消耗
-int pass_cost_()
-{
-    return 1;
-}
-
-// 磁头跳到特定块的令牌消耗
-int jump_cost_()
-{
-    return G;
-}
-
 
 void timestamp_action()
 {
@@ -609,7 +607,7 @@ int best_way_to_move(int last_status, int last_cost, int disk_id, int position, 
      *      1:  下一步选择read   扣减tokens
      *      -1: 令牌数不够
      */
-    if (tokens < pass_cost_())
+    if (tokens < PASS_COST)
     {
         return -1;
     }
@@ -631,7 +629,7 @@ int best_way_to_move(int last_status, int last_cost, int disk_id, int position, 
         }
         read_last_cost = read_cost_(read_last_status, read_last_cost);
         read_last_status = std::max(1, read_last_status + 1);
-        pass_last_cost = pass_cost_();
+        pass_last_cost = PASS_COST;
         pass_last_status = 0;
 
         read_sum_cost += last_cost;
@@ -649,7 +647,7 @@ int best_way_to_move(int last_status, int last_cost, int disk_id, int position, 
         }
         return  -1;
     }
-    tokens -= pass_cost_();
+    tokens -= PASS_COST;
     return 0;
 }
 
@@ -684,12 +682,12 @@ Page_* search_best_page(int disk_id)
     for (int i = 1; i <= PAGE_NUM; i ++)
     {
         Page_ *p = &pages[disk_id][i];
-        float sum_weights = 0;
+        int sum_weights = 0;
         // 选择磁头直接跳到页首，还是一格一格移过去
         // int position = p -> position;
-        // int sum_tokens = std::min(G, ((p -> position - disk_point[disk_id] + V) % V) * pass_cost_());
+        // int sum_tokens = std::min(G, ((p -> position - disk_point[disk_id] + V) % V) * PASS_COST);
         int position = p == now_page? disk_point[disk_id]: p -> position;
-        int sum_tokens = std::min(G, ((position - disk_point[disk_id] + V) % V) * pass_cost_());
+        int sum_tokens = std::min(G, ((position - disk_point[disk_id] + V) % V) * PASS_COST);
         int tokens_origin = 1e9, tokens = 1e9;
 
         for(int j = position; j <= p -> position + p -> page_size; j ++)
@@ -702,7 +700,7 @@ Page_* search_best_page(int disk_id)
             if (move_type == 0)
             {
                 last_status = 0;
-                last_cost = pass_cost_();
+                last_cost = PASS_COST;
             } else
             {
                 last_cost = read_cost_(last_status, last_cost);
@@ -712,7 +710,7 @@ Page_* search_best_page(int disk_id)
         }
         sum_tokens += (tokens_origin - tokens);
         // float score = sum_weights / (static_cast<float>(sum_tokens) + 1);
-        float score = sum_weights / static_cast<float>(sum_tokens);
+        float score = static_cast<float>(sum_weights) / static_cast<float>(sum_tokens);
         if (score > max_score)
         {
             max_score = score;
@@ -739,7 +737,7 @@ void move_point(int disk_id, int move_type)
     }else
     {
         // 下一块的操作为pass
-        disk_point_last_cost[disk_id] = pass_cost_();
+        disk_point_last_cost[disk_id] = PASS_COST;
         disk_point_last_status[disk_id] = 0;
         result[disk_id].append("p");
     }
@@ -813,7 +811,7 @@ std::vector<Request*> do_objects_read()
         {
             // 目标页是其它页，那么先转去跳转
             disk_point_last_done[i] = false;
-            if (G <= (best_page -> position - disk_point[i] + V) % V * pass_cost_())
+            if (JUMP_COST <= (best_page -> position - disk_point[i] + V) % V * PASS_COST)
             {
                 // 目标页太远，直接跳
                 disk_point[i] = best_page -> position;
@@ -827,7 +825,7 @@ std::vector<Request*> do_objects_read()
                 while (disk_point[i] != best_page -> position)
                 {
                     move_point(i, 0);
-                    tokens -= pass_cost_();
+                    tokens -= PASS_COST;
                 }
             }
         }
