@@ -136,9 +136,9 @@ int visited[MAX_DISK_NUM][MAX_DISK_SIZE];
 // 未完成且仍有效的读请求列表 (status均为0)
 std::deque<Request*> unfinished;
 // 维护所有请求的完成状态 (0:还未完成, 1:已完成)
-std::bitset<MAX_REQUEST_NUM> request_finished;
+bool request_finished[MAX_REQUEST_NUM];
 // 维护所有请求的删除状态 (0:未删除, 1:已删除)
-std::bitset<MAX_REQUEST_NUM> request_deleted;
+bool request_deleted[MAX_REQUEST_NUM];
 // 当前时间片的磁头移动情况
 std::string result[MAX_DISK_NUM];
 
@@ -203,7 +203,7 @@ void update_unfinished(std::vector<Request*> &added)
         Request *r = unfinished.front();
         unfinished.pop_front();
 
-        if ((now_time - r -> timestamp < MAX_ALIVE) && (! request_deleted.test(r -> id)) && (! request_finished.test(r -> id)))
+        if ((now_time - r -> timestamp < MAX_ALIVE) && (! request_deleted[r -> id]) && (! request_finished[r -> id]))
         {
             // 如果r没过期，并且没被删除和完成，则重新入队
             unfinished.push_back(r);
@@ -378,7 +378,7 @@ void delete_action()
         int id = _id[i];
         int current_id = object[id].last_request_point;
         while (current_id != 0) {
-            if (request_finished.test(current_id) == false) {
+            if (request_finished[current_id] == false) {
                 abort_num++;
             }
             current_id = request[current_id].prev_id;
@@ -394,9 +394,9 @@ void delete_action()
         // 输出所有取消的请求编号，并设置标识位
         int current_id = obj -> last_request_point;
         while (current_id != 0) {
-            if (request_finished.test(current_id) == false) {
+            if (request_finished[current_id] == false) {
                 printf("%d\n", current_id);
-                request_deleted.set(current_id);
+                request_deleted[current_id] = true;
             }
             current_id = request[current_id].prev_id;
         }
@@ -766,7 +766,7 @@ bool update_request(Request *r)
     if (r -> block_status.count() == obj -> size)
     {
         // r已经完成
-        request_finished.set(r -> id);
+        request_finished[r -> id] = true;
         return true;
     }
     return false;
