@@ -1,0 +1,3 @@
+/Users/songchangtian/Documents/2025-code-craft-preliminary/demos/cpp/cmake-build-debug/CMakeFiles/code_craft.dir
+/Users/songchangtian/Documents/2025-code-craft-preliminary/demos/cpp/cmake-build-debug/CMakeFiles/edit_cache.dir
+/Users/songchangtian/Documents/2025-code-craft-preliminary/demos/cpp/cmake-build-debug/CMakeFiles/rebuild_cache.dir

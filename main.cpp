@@ -31,15 +31,19 @@
 // 最大重试次数（调试用）
 #define MAX_RETRY (100)
 // 一个读请求的最长存活时间，可以控制代码运行时间 (最大取105)
-#define MAX_ALIVE (80)
-// 默认页大小（不是最终的页大小，init里还需要自适应计算）
-#define DEFAULT_PAGE_SIZE (500)
+#define MAX_ALIVE (105)
+// 期望的最小页数（不是最终的PAGE_NUM）
+#define MIN_PAGE_NUM (1)
+// 期望的最大页数（不是最终的PAGE_NUM）
+#define MAX_PAGE_NUM (1)
 // 权重阈值，如果当前块的权重比该值低就不读了，直接跳过
 #define WEIGHT_THRESHOULD (1 * REP_NUM)
 // 阈值gamma，当该页的剩余部分平均收益小于前面部分平均收益的gamma倍时，把该磁头的状态标记为已完成
-#define EARLY_STOP_THRESHOULD (0.2)
-// 窗口尺寸，作为贪心策略的参数，决定是否要读当前对象块，或是pass （调参发现等于9时效果最好）
-#define WINDOW_SIZE (9)
+#define EARLY_STOP_THRESHOULD (0.1)
+// 每个时间片都以最理想的情况读取时，限制unfinished队列大小的参数 (用于剔除在磁头读取能力之外的读请求)
+#define RESERVING_ROUNDS (50)
+// 窗口尺寸，作为贪心策略的参数，决定是否要读当前对象块，或是pass (设为0时，采用自适应计算的窗口大小；非0时调参发现9附近效果最好)
+#define WINDOW_SIZE (0)
 // 随机数种子，设置为0代表使用当前系统时间
 #define RANDOM_SEED (114514)
 
@@ -73,7 +77,7 @@ typedef struct Object_ {
 } Object;
 
 // 定义页结构
-struct Page_
+typedef struct Page_
 {
     int disk_id = 0;        // 所在磁盘的id
     int position = 0;       // 第一个块在磁盘中的位置 (1 ~ V)
@@ -83,11 +87,13 @@ struct Page_
     int cnt[MAX_M] = {0};   // 各个类型的对象块数量
     int max_cnt = 0;        // 占比最高的对象块类型数量 (1 ~ page_size)
     int max_tag = 0;        // 占比最高的对象块类型 (1 ~ V)
-    Page_() = default;
-    Page_(int _disk_id, int _page_index):
-        disk_id(_disk_id), page_index(_page_index) {}
-    Page_(int _disk_id, int _position, int _pagesize, int _page_index, int _usable_size):
-        disk_id(_disk_id), position(_position), page_size(_pagesize), page_index(_page_index), usable_size(_usable_size) {}
+    bool is_ok = false;     // 标识位，初始化后仍为false的页直接被弃用
+
+    // Page_() = default;
+    // Page_(int _disk_id, int _page_index):
+    //     disk_id(_disk_id), page_index(_page_index) {}
+    // Page_(int _disk_id, int _position, int _pagesize, int _page_index, int _usable_size):
+    //     disk_id(_disk_id), position(_position), page_size(_pagesize), page_index(_page_index), usable_size(_usable_size) {}
 
     bool friend operator < (const Page_ &aa, const Page_ &bb) {
         if (aa.disk_id == bb.disk_id)
@@ -96,61 +102,78 @@ struct Page_
         }
         return aa.disk_id < bb.disk_id;
     }
-};
+}Page;
+
+// 定义磁盘间页的绑定方式
+typedef struct PageBinding_
+{
+    // 当前页的磁盘号、页号
+    int disk_id;
+    int page_index;
+    // 当前页是绑定关系中的第rep_id个副本
+    int rep_id;
+
+    // 指向绑定关系中的其它页
+    PageBinding_ *bindings[REP_NUM + 1];
+}PageBinding;
 
 // 定义链表节点
 typedef struct Node_ {
-    // 请求id
-    int request_id;
+    // 要保存的数据索引
+    int id;
     Node_ *prev;
     Node_ *next;
     Node_() = default;
-    explicit  Node_(int _request_id): request_id(_request_id), prev(nullptr), next(nullptr){}
+    explicit  Node_(int _id): id(_id), prev(nullptr), next(nullptr){}
 }Node;
 
 // 定义双向链表
-class Deque
+typedef struct Deque_
 {
-public:
     // 头节点和尾节点均不保存数据
     Node_ *head;
     Node_ *tail;
-    // 定义从请求id到链表节点指针的映射，实现O(1)删除
-    Node_ **mp;
+    // 定义从id到链表节点指针的映射，实现O(1)删除
+    // id范围：1 ~ cnt
+    Node_ **mp = nullptr;
     // 节点数量（不含头、尾节点）
     int cnt;
-
-    Deque()
+    Deque_()
     {
         this -> head = new Node_();
         this -> tail = new Node_();
         this -> head -> next = this -> tail;
         this -> tail -> prev = this -> head;
-        this -> mp = new Node_*[MAX_REQUEST_NUM]();
         this -> cnt = 0;
     }
 
-    // 删除request_id的节点
-    void erase(int request_id)
+    // 每个Deque创建完后都要
+    void init(int size)
     {
-        if (mp[request_id] == nullptr)
+        this -> mp = new Node_*[size + 1]();
+    }
+
+    // 删除id的节点
+    void erase(int id)
+    {
+        if (mp[id] == nullptr)
         {
             return;
         }
-        Node_ *p = mp[request_id];
+        Node_ *p = mp[id];
         Node_ *prev = p -> prev, *next = p -> next;
         prev -> next = next;
         next -> prev = prev;
-        mp[request_id] = nullptr;
+        mp[id] = nullptr;
 
         this -> cnt --;
     };
 
     // 插入表尾部
-    void append(int request_id)
+    void append(int id)
     {
-        mp[request_id] = new Node_(request_id);
-        Node_ *p = mp[request_id], *prev = tail -> prev;
+        mp[id] = new Node_(id);
+        Node_ *p = mp[id], *prev = tail -> prev;
 
         prev -> next = p;
         p -> prev = prev;
@@ -160,11 +183,17 @@ public:
         this -> cnt ++;
     }
 
-    // 获取表头节点的request_id
+    // // 插入表中合适的位置，使得链表保持按id有序
+    // void insert(int id)
+    // {
+    //
+    // }
+
+    // 获取表头节点的id
     int front()
     {
         Node_ *front = this -> head -> next;
-        return front -> request_id;
+        return front -> id;
     }
 
     // 弹出表头节点
@@ -175,9 +204,15 @@ public:
         this -> head -> next = next;
         next -> prev = this -> head;
 
-        mp[front -> request_id] = nullptr;
+        mp[front -> id] = nullptr;
 
         this -> cnt --;
+    }
+
+    // 是否有编号为id的节点
+    bool exist(int id)
+    {
+        return this -> mp[id] != nullptr;
     }
 
     int size()
@@ -185,7 +220,7 @@ public:
         return this -> cnt;
     }
 
-};
+}Deque;
 
 
 /**
@@ -193,21 +228,23 @@ public:
  *  需要全局维护的变量
  *
  */
-int T, M, N, V, G;
+
+int T, M, N, pre_V, G;
+int V[MAX_DISK_NUM];
 /**
  *  TODO: 还没使用统计信息
  */
 int fre_del[MAX_M][(MAX_TIME + FRE_PER_SLICING - 1) / FRE_PER_SLICING];
 int fre_write[MAX_M][(MAX_TIME + FRE_PER_SLICING - 1) / FRE_PER_SLICING];
 int fre_read[MAX_M][(MAX_TIME + FRE_PER_SLICING - 1) / FRE_PER_SLICING];
-Request request[MAX_REQUEST_NUM];
-Object object[MAX_OBJECT_NUM];
+Request requests[MAX_REQUEST_NUM];
+Object objects[MAX_OBJECT_NUM];
 int now_time;
 
 // 一个磁盘划分的页数量
 int PAGE_NUM;
 // 页大小（每个磁盘最后一页的大小可能不等于PAGE_SIZE）
-int PAGE_SIZE = DEFAULT_PAGE_SIZE;
+int PAGE_SIZE;
 // 磁盘存储状态
 int disk[MAX_DISK_NUM][MAX_DISK_SIZE];
 // 磁头当前位置
@@ -230,11 +267,13 @@ int PASS_COST;
 int MAX_DEQUE_SIZE;
 
 // 维护磁盘i中第j个页
-Page_ pages[MAX_DISK_NUM][MAX_PAGE_NUM];
+Page pages[MAX_DISK_NUM][MAX_PAGE_NUM + 1];
 // 维护磁盘i中主要对象块类型为j，非空且非满的页号
-std::set<int> st[MAX_DISK_NUM][MAX_M];
+Deque st[MAX_DISK_NUM][MAX_M];
+// 维护页的绑定关系
+PageBinding bindings[MAX_DISK_NUM][MAX_PAGE_NUM + 1];
 // 维护当前仍有效的读请求
-Deque unfinished = Deque();
+Deque unfinished;;
 // 维护历史所有请求的完成状态 (0:未完成, 1:已完成)
 bool request_finished[MAX_REQUEST_NUM];
 // 维护历史所有请求的删除状态 (0:未删除, 1:已删除)
@@ -263,6 +302,8 @@ std::vector<int> added_object_ids;
 std::vector<int> added_request_ids;
 // 每个时间片完成的请求id列表
 std::vector<int> finished_request_ids;
+// 每个时间片中，已经排除掉的页
+std::set<Page*> excepted_pages;
 // 当前时间片的磁头移动结果 (用于输出)
 std::string result[MAX_DISK_NUM];
 
@@ -277,7 +318,15 @@ std::string result[MAX_DISK_NUM];
 // 预输入与全局初始化
 void init()
 {
-    scanf("%d%d%d%d%d", &T, &M, &N, &V, &G);
+    // 调试用
+    // 86400 16 10 5792 350
+    // T = 86400;
+    // M = 16;
+    // N = 10;
+    // V = 5792;
+    // G = 350;
+
+    scanf("%d%d%d%d%d", &T, &M, &N, &pre_V, &G);
     for (int i = 1; i <= M; i++) {
         for (int j = 1; j <= (T - 1) / FRE_PER_SLICING + 1; j++) {
             scanf("%d", &fre_del[i][j]);
@@ -298,29 +347,124 @@ void init()
     // 初始化随机种子
     std::srand(RANDOM_SEED);
 
-    // 参数自适应初始化
+    // 初始化常量
     JUMP_COST = G;
     PASS_COST = 1;
-    PAGE_SIZE = std::min(V, PAGE_SIZE);
-    PAGE_SIZE = std::max(PAGE_SIZE, V / 16);
-    PAGE_NUM = (V + PAGE_SIZE - 1) / PAGE_SIZE;
-    MAX_DEQUE_SIZE = std::max(G / 16 / 1 * N * 50, 1);
 
-    // 初始化磁头位置
+    // 自适应计算最优的PAGE_NUM和PAGE_SIZE
+    assert(MIN_PAGE_NUM >= 1 && MIN_PAGE_NUM <= pre_V);
+    assert(MAX_PAGE_NUM >= 1 && MAX_PAGE_NUM <= pre_V);
+    assert(MIN_PAGE_NUM <= MAX_PAGE_NUM);
+    // 找到能刚好整除V的PAGE_NUM
+    PAGE_NUM = MAX_PAGE_NUM;
+    while (pre_V % PAGE_NUM != 0 && PAGE_NUM <= MAX_PAGE_NUM)
+    {
+        PAGE_NUM ++;
+    }
+    if (PAGE_NUM > MAX_PAGE_NUM)
+    {
+        // 如果找不到这样的PAGE_NUM，就调整V的大小，使得浪费的空间最少
+        int wasted = 1e9;
+        for (int i = MIN_PAGE_NUM; i <= MAX_PAGE_NUM; i ++)
+        {
+            if (pre_V - (pre_V / i) * i < wasted)
+            {
+                PAGE_NUM = i;
+                wasted = pre_V - (pre_V / i) * i ;
+            }
+        }
+        pre_V -= wasted;
+    }
+    PAGE_SIZE = pre_V / PAGE_NUM;
+    // PAGE_SIZE = std::min(V, DEFAULT_PAGE_SIZE);
+    // PAGE_SIZE = std::max(PAGE_SIZE, V / 16);
+    // PAGE_NUM = (V + PAGE_SIZE - 1) / PAGE_SIZE;
+
+    // 最大的有效请求数 = 每个时间片完成读请求的能力上限 * 预留轮数
+    MAX_DEQUE_SIZE = std::max(G / 16 / 1 * N * RESERVING_ROUNDS, 1);
+
+    // 初始化磁头
     for (int i = 1; i <= N; i++) {
         disk_point[i] = 1;
-        disk_point_last_done[i] = 1;
+        disk_point_last_done[i] = true;
     }
+
+    //初始化页的绑定关系
+    // std::set<std::pair<int, int>, std::greater<> > tmp;
+    // auto cmp = [](const std::pair<int, int> &a, const std::pair<int, int> &b)
+    // {
+    //     if (a.first == b.first) return a.second < b.second;
+    //     return a.first > b.first;
+    // };
+    std::deque<std::pair<int, int> > tmp;
+    // std::set<std::pair<int, int>, decltype(cmp)> tmp(cmp);
+
+    for (int j = 1; j <= PAGE_NUM; j ++)
+    {
+        for (int i = 1; i <= N; i ++)
+        {
+            tmp.push_back(std::make_pair(i, j));
+        }
+    }
+
+
+    int tmp_disk_id[REP_NUM + 1], tmp_page_index[REP_NUM + 1];
+    while (tmp.size() >= REP_NUM)
+    {
+        for (int i = 1; i <= REP_NUM; i ++)
+        {
+            std::pair<int, int> p = tmp.front();
+            tmp.pop_front();
+            tmp_disk_id[i] = p.first;
+            tmp_page_index[i] = p.second;
+        }
+        for (int i = 1; i <= REP_NUM; i ++)
+        {
+            int disk_id = tmp_disk_id[i], page_index = tmp_page_index[i];
+
+            bindings[disk_id][page_index].disk_id = disk_id;
+            bindings[disk_id][page_index].page_index = page_index;
+            bindings[disk_id][page_index].rep_id = i;
+            pages[disk_id][page_index].is_ok = true;
+
+            for (int j = 1; j <= REP_NUM; j ++)
+            {
+                int n_disk_id = tmp_disk_id[j], n_page_index = tmp_page_index[j];
+                bindings[disk_id][page_index].bindings[j] = &bindings[n_disk_id][n_page_index];
+            }
+        }
+    }
+
     // 初始化页表
     for (int i = 1; i <= N; i ++)
     {
+        int capacy = 0;
         for (int j = 1; j <= PAGE_NUM; j ++)
         {
+            if (! pages[i][j].is_ok)    continue;
             int position = (j - 1) * PAGE_SIZE + 1;
-            int page_size = j * PAGE_SIZE <= V? PAGE_SIZE: V - position + 1;
-            pages[i][j] = Page_(i, position, page_size, j, page_size);
+            // int page_size = j * PAGE_SIZE <= V? PAGE_SIZE: V - position + 1;
+
+            pages[i][j].disk_id = i;
+            pages[i][j].position = position;
+            pages[i][j].page_size = PAGE_SIZE;
+            pages[i][j].page_index = j;
+            pages[i][j].usable_size = PAGE_SIZE;
+
+            capacy += PAGE_SIZE;
         }
-        usable_capacy[i] = V;
+        usable_capacy[i] = capacy;
+        V[i] = capacy;
+    }
+
+    // Deque初始化
+    unfinished.init(MAX_REQUEST_NUM);
+    for (int i = 1; i <= N; i ++)
+    {
+        for (int j = 1; j <= M; j ++)
+        {
+            st[i][j].init(MAX_PAGE_NUM);
+        }
     }
 }
 
@@ -331,11 +475,12 @@ void init_per_timestamp()
     deleted_object_ids.clear();
     added_request_ids.clear();
     finished_request_ids.clear();
+    excepted_pages.clear();
 
     for (int i = 1; i <= N; i ++)
     {
         result[i].clear();
-        for (int j = 1; j <= V; j ++)
+        for (int j = 1; j <= V[i]; j ++)
         {
             weights[i][j] = 0;
             visited[i][j] = 0;
@@ -359,18 +504,18 @@ void update_unfinished()
         unfinished.pop_front();
     }
     // 过期的Request
-    while (unfinished.size() > 0 && (now_time - request[unfinished.front()].timestamp > MAX_ALIVE))
+    while (unfinished.size() > 0 && (now_time - requests[unfinished.front()].timestamp > MAX_ALIVE))
     {
         unfinished.pop_front();
     }
     // 删除的Object绑定的Request
     for (int object_id: deleted_object_ids)
     {
-        int request_id = object[object_id].last_request_point;
+        int request_id = objects[object_id].last_request_point;
         while (request_id > 0)
         {
             unfinished.erase(request_id);
-            request_id = request[request_id].prev_id;
+            request_id = requests[request_id].prev_id;
         }
     }
 }
@@ -378,7 +523,7 @@ void update_unfinished()
 void printDisks(){
     printf("printing disks...\n");
     for (int i = 1; i <= N; i ++) {
-        for(int j = 1; j <= V; j ++) {
+        for(int j = 1; j <= pre_V; j ++) {
             printf("%d ", disk[i][j]);
         }
         printf("\n");
@@ -403,7 +548,8 @@ Page_* find_page_(int disk_id, int position)
 Page_* next_page_(Page_ *now_page)
 {
     int disk_id = now_page -> disk_id, page_index = now_page -> page_index;
-    return &pages[disk_id][page_index % PAGE_NUM + 1];
+    Page_ *p = &pages[disk_id][page_index % PAGE_NUM + 1];
+    return p -> is_ok? p: &pages[disk_id][1];
 }
 
 // 当前时间片所在的时间段下标
@@ -486,15 +632,14 @@ void do_object_delete(Object *obj)
                     p -> max_cnt = max_cnt;
 
                     // 更新st
-                    auto iter = st[disk_id][lst_max_tag].find(p -> page_index);
-                    if (iter != st[disk_id][lst_max_tag].end())
+                    if (st[disk_id][lst_max_tag].exist(p -> page_index))
                     {
-                        st[disk_id][lst_max_tag].erase(iter);
+                        st[disk_id][lst_max_tag].erase(p -> page_index);
                     }
-                    iter = st[disk_id][max_tag].find(p -> page_index);
-                    if (max_cnt > 0 && iter == st[disk_id][max_tag].end())
+
+                    if (max_cnt > 0 && !st[disk_id][max_tag].exist(p -> page_index))
                     {
-                        st[disk_id][max_tag].insert(p -> page_index);
+                        st[disk_id][max_tag].append(p -> page_index);
                     }
                 }
             }
@@ -523,19 +668,19 @@ void delete_action()
 
     for (int i = 1; i <= n_delete; i++) {
         int id = _id[i];
-        int current_id = object[id].last_request_point;
+        int current_id = objects[id].last_request_point;
         while (current_id != 0) {
             if (request_finished[current_id] == false) {
                 abort_num++;
             }
-            current_id = request[current_id].prev_id;
+            current_id = requests[current_id].prev_id;
         }
     }
 
     printf("%d\n", abort_num);
     for (int i = 1; i <= n_delete; i++) {
         int id = _id[i];
-        Object *obj = &object[id];
+        Object *obj = &objects[id];
         do_object_delete(obj);
 
         // 输出所有取消的请求编号，并设置标识位
@@ -545,7 +690,7 @@ void delete_action()
                 printf("%d\n", current_id);
                 request_deleted[current_id] = true;
             }
-            current_id = request[current_id].prev_id;
+            current_id = requests[current_id].prev_id;
         }
     }
 
@@ -559,97 +704,122 @@ void delete_action()
  *  写事件
  *
  */
-// 把对象obj的第rep_idx个副本写进磁盘disk_id，并更新存储信息和页信息（自动找到最合适的写入位置，调用函数前保证一定有足够空间）
-void object_write_(Object *obj, int disk_id, int rep_idx)
+// 把对象obj写进磁盘disk_id，并更新存储信息和页信息（自动找到最合适的写入位置，调用函数前保证一定有足够空间）
+bool object_write_(Object *obj, int disk_id)
 {
-    /** 1. 找到合适的写入位置
-     *  2. 写入对象，更新存储信息disk
+    /** 1. 先在当前磁盘上找到合适的写入位置，并找到这个位置绑定的其它页
+     *  2. 写入对象到当前绑定的3个页上，更新存储信息disk
      *  3. 更新对象信息obj
      *  4. 更新页信息pages
      *  5. 更新可用空间usable_capacy
      *  6. 更新st
      */
 
-    // 设置obj第rep_idx个副本的磁盘号，分配对象块到磁盘位置映射的内存
-    obj -> replica[rep_idx] = disk_id;
-    obj -> unit[rep_idx] = static_cast<int*>(malloc(sizeof(int) * (obj -> size + 1)));
-
-    // obj已经写入的块数量
-    int write_num = 0;
-
-    // 写入
-    while (write_num < obj -> size)
+    // 先找到一个剩余空间足够写入的页
+    // 当前要写入的页
+    Page_ *p = nullptr;
+    if (st[disk_id][obj -> tag].size() > 0)
     {
-        // 当前要写入的页
-        Page_ *p = nullptr;
-        if (!st[disk_id][obj -> tag].empty())
+        // 磁盘disk_id上存在obj.tag占比最大的页，则去找一个能写下当前对象的页
+        for (Node_ *node = st[disk_id][obj -> tag].head -> next; node != st[disk_id][obj -> tag].tail; node = node -> next)
         {
-            // 磁盘disk_id上存在obj.tag占比最大的页，则页的起点取st中的第一个（页下标最小）
-            auto tmp = st[disk_id][obj -> tag].begin();
-            p = &pages[disk_id][*tmp];
-            st[disk_id][obj -> tag].erase(tmp);
-        } else
-        {
-            Page_ *p_max_usable = nullptr;
-            int max_usable_size = -1;
-            /** TODO: 策略需要改进（目前代码只实现了1）
-             *  1. 优先找到max_tag相同的非空非满页
-             *  2. 如果没有符合1的页，找到附近有相同max_tag，且距离最近的空页
-             *  3. 如果没有符合2的空页，则遍历找到cnt[tag]最大且非0的页
-             *  4. 如果没有符合3的空页，则遍历找到usable_size最大的页
-             */
-            for (int i = 1; i <= PAGE_NUM; i ++)
-            {
-                if (pages[disk_id][i].usable_size == pages[disk_id][i].page_size)
-                {
-                    p = &pages[disk_id][i];
-                    break;
-                }
-                if (pages[disk_id][i].usable_size > max_usable_size)
-                {
-                    max_usable_size = pages[disk_id][i].usable_size;
-                    p_max_usable = &pages[disk_id][i];
-                }
-            }
-
-            // 如果空页也没有，就找一个剩余空间最大的页
-            if (p == nullptr)
-            {
-                p = p_max_usable;
-            }
-        }
-
-        // 至少要能找到一个页写入
-        assert(p != nullptr);
-        for (int j = p -> position; j <= p -> position + p -> page_size - 1 && write_num < obj -> size; j ++)
-        {
-            if (disk[disk_id][j] == 0)
-            {
-                // 磁盘disk_id上位置j为空，可以写入
-                // 维护磁盘信息
-                disk[disk_id][j] = obj -> id;
-                // 维护对象信息
-                obj -> unit[rep_idx][++ write_num] = j;
-                // 维护页信息
-                p -> cnt[obj -> tag] ++;
-                p -> usable_size --;
-                if (p -> max_tag ==0 || p -> cnt[obj -> tag] > p -> cnt[p -> max_tag])
-                {
-                    // 占比最大的类型发生了变化
-                    p -> max_tag = obj -> tag;
-
-                }
-                p -> max_cnt = p -> cnt[p -> max_tag];
-                // 维护磁盘剩余容量
-                usable_capacy[disk_id] --;
-            }
-        }
-        if (p -> usable_size != 0 && st[disk_id][p -> max_tag].find(p -> page_index) == st[disk_id][p -> max_tag].end())
-        {
-            // 维护st：如果当前页没写满，就在st中加上这一页
-            st[disk_id][p -> max_tag].insert(p -> page_index);
+            int page_index = node -> id;
+            if (pages[disk_id][page_index].usable_size < obj -> size)   continue;
+            p = &pages[disk_id][page_index];
+            break;
         }
     }
+    if (p == nullptr)
+    {
+        Page_ *p_max_usable = nullptr;
+        int max_usable_size = -1;
+        /** TODO: 策略需要改进（目前代码只实现了1）
+         *  1. 优先找到max_tag相同的非空非满页
+         *  2. 如果没有符合1的页，找到附近有相同max_tag，且距离最近的空页
+         *  3. 如果没有符合2的空页，则遍历找到cnt[tag]最大且非0的页
+         *  4. 如果没有符合3的空页，则遍历找到usable_size最大的页
+         */
+        for (int i = 1; i <= PAGE_NUM; i ++)
+        {
+            if (! pages[disk_id][i].is_ok)  continue;
+            if (pages[disk_id][i].usable_size == pages[disk_id][i].page_size)
+            {
+                p = &pages[disk_id][i];
+                break;
+            }
+            if (pages[disk_id][i].usable_size > max_usable_size)
+            {
+                max_usable_size = pages[disk_id][i].usable_size;
+                p_max_usable = &pages[disk_id][i];
+            }
+        }
+        // 如果空页也没有，就找一个剩余空间最大的页
+        if (p == nullptr && p_max_usable != nullptr && p_max_usable -> usable_size >= obj -> size)
+        {
+            p = p_max_usable;
+        }
+    }
+
+    // 找不到足够大的空位，则当前磁盘的写入操作失败
+    if (p == nullptr)   return false;
+
+    PageBinding *binding = &bindings[p -> disk_id][p -> page_index];
+    // 设置obj第rep_idx个副本的磁盘号，分配对象块到磁盘位置映射的内存
+    for (int rep_id = 1; rep_id <= REP_NUM; rep_id ++)
+    {
+        Page_ *q = &pages[binding -> bindings[rep_id] -> disk_id][binding -> bindings[rep_id] -> page_index];
+        obj -> replica[rep_id] = q -> disk_id;
+        if (q -> max_tag == obj -> tag)
+        {
+            st[q -> disk_id][obj -> tag].erase(q -> page_index);
+        }
+    }
+
+    // 写入
+    int write_num = 0;
+    for (int offset = 0; offset <= p -> page_size - 1 && write_num < obj -> size; offset ++)
+    {
+        if (disk[p -> disk_id][p -> position + offset] == 0)
+        {
+            write_num ++;
+            // 磁盘disk_id上位置j为空，可以写入
+            for (int rep_id = 1; rep_id <= REP_NUM; rep_id ++)
+            {
+                Page_ *q = &pages[binding -> bindings[rep_id] -> disk_id][binding -> bindings[rep_id] -> page_index];
+                // 维护磁盘信息
+                disk[q -> disk_id][q -> position + offset] = obj -> id;
+                // 维护对象信息
+                obj -> unit[rep_id][write_num] = q -> position + offset;
+                // 维护页信息
+                q -> cnt[obj -> tag] ++;
+                q -> usable_size --;
+
+
+                if (q -> max_tag ==0 || q -> cnt[obj -> tag] > q -> cnt[q -> max_tag])
+                {
+                    // 占比最大的类型发生了变化
+                    q -> max_tag = obj -> tag;
+
+                }
+                q -> max_cnt = q -> cnt[q -> max_tag];
+                // 维护磁盘剩余容量
+                usable_capacy[q -> disk_id] --;
+
+            }
+        }
+    }
+
+    for (int rep_id = 1; rep_id <= REP_NUM; rep_id ++)
+    {
+        Page_ *q = &pages[binding -> bindings[rep_id] -> disk_id][binding -> bindings[rep_id] -> page_index];
+        if (q -> usable_size != 0 && ! st[q -> disk_id][q -> max_tag].exist(q -> page_index))
+        {
+            // 维护st：如果当前页没写满，就在st中加上这一页
+            st[q -> disk_id][q -> max_tag].append(q -> page_index);
+        }
+    }
+
+    return true;
 }
 
 // 写这个时间片的全部对象
@@ -665,26 +835,24 @@ void do_objects_write()
 
     for (int object_id: added_object_ids)
     {
-        Object *obj = &object[object_id];
+        Object *obj = &objects[object_id];
         int count_retry = 0;
-        std::vector<bool> bit_map(N + 1, false);
-        for (int i = 1; i <= REP_NUM; i ++)
+
+        for (int rep_id = 1; rep_id <= REP_NUM; rep_id ++)
+        {
+            obj -> unit[rep_id] = static_cast<int*>(malloc(sizeof(int) * (obj -> size + 1)));
+        }
+
+        while (true)
         {
             // 重试MAX_RETRY次都没能成功，说明没有足够存储空间了
             assert(count_retry < MAX_RETRY);
-            // 随机生成一个合法的disk_id
-            int disk_id = std::rand() % N + 1;
-            if (bit_map[disk_id] || usable_capacy[disk_id] < obj -> size)
-            {
-                count_retry ++;
-                i --;
-                continue;
-            }
-            object_write_(obj, disk_id, i);
-            bit_map[disk_id] = true;
-            count_retry = 0;
+            count_retry ++;
 
-            // printDisks();
+            int disk_id = std::rand() % N + 1;
+            if (usable_capacy[disk_id] < obj -> size)   continue;
+            if (! object_write_(obj, disk_id))  continue;
+            break;
         }
     }
 }
@@ -698,11 +866,11 @@ void write_action()
     for (int i = 1; i <= n_write; i++) {
         int id, size, tag;
         scanf("%d%d%d", &id, &size, &tag);
-        object[id].last_request_point = 0;
-        object[id].size = size;
-        object[id].tag = tag;
-        object[id].is_delete = false;
-        object[id].id = id;
+        objects[id].last_request_point = 0;
+        objects[id].size = size;
+        objects[id].tag = tag;
+        objects[id].is_delete = false;
+        objects[id].id = id;
         added_object_ids.push_back(id);
     }
 
@@ -710,13 +878,13 @@ void write_action()
     do_objects_write();
 
     for (int id: added_object_ids) {
-        int size = object[id].size;
+        int size = objects[id].size;
 
         printf("%d\n", id);
         for (int j = 1; j <= REP_NUM; j++) {
-            printf("%d", object[id].replica[j]);
+            printf("%d", objects[id].replica[j]);
             for (int k = 1; k <= size; k++) {
-                printf(" %d", object[id].unit[j][k]);
+                printf(" %d", objects[id].unit[j][k]);
             }
             printf("\n");
         }
@@ -735,7 +903,7 @@ void write_action()
 // 给r还未完成的块添加权重
 void add_weights(Request *r)
 {
-    Object *obj = &object[r -> object_id];
+    Object *obj = &objects[r -> object_id];
     for (int i = 1; i <= REP_NUM; i ++)
     {
         for (int j = 1; j <= obj -> size; j ++)
@@ -796,8 +964,10 @@ int best_way_to_move(int last_status, int last_cost, int disk_id, int position, 
      */
 
     // 理论最优的窗口大小
+    // 实际情况并不理想，因此设置为一个可调参数WINDOW_SIZE
     int length;
-    if (last_status <= 0)       length = 1;
+    if (WINDOW_SIZE != 0)       length = WINDOW_SIZE;
+    else if (last_status <= 0)  length = 1;
     else if (last_cost > 52)    length = 4;
     else if (last_cost > 42)    length = 6;
     else if (last_cost > 34)    length = 8;
@@ -807,16 +977,13 @@ int best_way_to_move(int last_status, int last_cost, int disk_id, int position, 
     else                        length = 11;
 
 
-    // 实际情况并不理想，因此设置为一个可调参数WINDOW_SIZE
-    // int length = WINDOW_SIZE;
-
     if (tokens < PASS_COST) return -1;
     int move_type;
     int window_weight;
-    int end_position = (position + length - 1) % V + 1;
-    if (end_position <= position || length >= V)
+    int end_position = (position + length - 1) % V[disk_id] + 1;
+    if (end_position <= position || length >= V[disk_id])
     {
-        window_weight = s_weights[disk_id][V] - s_weights[disk_id][position - 1] + s_weights[disk_id][end_position];
+        window_weight = s_weights[disk_id][V[disk_id]] - s_weights[disk_id][position - 1] + s_weights[disk_id][end_position];
     }else
     {
         window_weight = s_weights[disk_id][end_position] - s_weights[disk_id][position - 1];
@@ -874,13 +1041,17 @@ Page_* search_best_page(int disk_id)
     for (int i = 1; i <= PAGE_NUM; i ++)
     {
         Page_ *p = &pages[disk_id][i];
+        if (! p -> is_ok || excepted_pages.find(p) != excepted_pages.end())
+        {
+            continue;
+        }
         int sum_weights = 0;
         // 选择磁头直接跳到页首，还是一格一格移过去
         // int position = p -> position;
         // int sum_tokens = std::min(G, ((p -> position - disk_point[disk_id] + V) % V) * PASS_COST);
         int position = p == now_page? disk_point[disk_id]: p -> position;
         int end_position = p -> position + p -> page_size - 1;
-        int sum_tokens = std::min(G, ((position - disk_point[disk_id] + V) % V) * PASS_COST);
+        int sum_tokens = std::min(JUMP_COST, ((position - disk_point[disk_id] + V[disk_id]) % V[disk_id]) * PASS_COST);
         int tokens_origin = 1e9, tokens = 1e9;
 
         for(int j = position; j <= end_position; j ++)
@@ -947,13 +1118,13 @@ void move_point(int disk_id, int move_type)
         disk_point_last_status[disk_id] = 0;
         result[disk_id].append("p");
     }
-    disk_point[disk_id] = disk_point[disk_id] % V + 1;
+    disk_point[disk_id] = disk_point[disk_id] % V[disk_id] + 1;
 }
 
 // 更新请求r的状态
 bool update_request(Request *r)
 {
-    Object_ *obj = &object[r -> object_id];
+    Object_ *obj = &objects[r -> object_id];
     std::bitset<MAX_BLOCKS> bits;
     for (int i = 1; i <= REP_NUM; i ++)
     {
@@ -992,12 +1163,12 @@ void do_objects_read()
     // 遍历每个已有请求，贡献权重
     for (Node_ *p = unfinished.head ->next; p != unfinished.tail; p = p -> next)
     {
-        add_weights(&request[p -> request_id]);
+        add_weights(&requests[p -> id]);
     }
     // 维护权重的前缀和
     for (int i = 1; i <= N; i ++)
     {
-        for (int j = 1; j <= V; j ++)
+        for (int j = 1; j <= V[i]; j ++)
         {
             s_weights[i][j] = s_weights[i][j - 1] + weights[i][j];
         }
@@ -1017,12 +1188,12 @@ void do_objects_read()
         {
             // 目标页是其它页，那么先转去跳转
             disk_point_last_done[i] = false;
-            if (JUMP_COST <= (best_page -> position - disk_point[i] + V) % V * PASS_COST)
+            if (JUMP_COST <= (best_page -> position - disk_point[i] + V[i]) % V[i] * PASS_COST)
             {
                 // 目标页太远，直接跳
                 disk_point[i] = best_page -> position;
                 disk_point_last_status[i] = -1;
-                disk_point_last_cost[i] = G;
+                disk_point_last_cost[i] = JUMP_COST;
                 result[i].append("j ").append(std::to_string(disk_point[i]));
                 tokens = 0;
             } else
@@ -1035,6 +1206,7 @@ void do_objects_read()
                 }
             }
         }
+        excepted_pages.insert(best_page);
 
         // 把剩下的令牌全消耗完
         while (true)
@@ -1072,7 +1244,7 @@ void do_objects_read()
     // 把unfinished队列的每个请求拿出来，检查是否完成
     for (Node_ *p = unfinished.tail -> prev; p != unfinished.head; p = p -> prev)
     {
-        Request_ *r = &request[p -> request_id];
+        Request_ *r = &requests[p -> id];
         if (update_request(r))
         {
             finished_request_ids.push_back(r -> id);
@@ -1093,11 +1265,11 @@ void read_action()
     scanf("%d", &n_read);
     for (int i = 1; i <= n_read; i++) {
         scanf("%d%d", &request_id, &object_id);
-        request[request_id].id = request_id;
-        request[request_id].object_id = object_id;
-        request[request_id].prev_id = object[object_id].last_request_point;
-        request[request_id].timestamp = now_time;
-        object[object_id].last_request_point = request_id;
+        requests[request_id].id = request_id;
+        requests[request_id].object_id = object_id;
+        requests[request_id].prev_id = objects[object_id].last_request_point;
+        requests[request_id].timestamp = now_time;
+        objects[object_id].last_request_point = request_id;
 
         added_request_ids.push_back(request_id);
     }
@@ -1126,7 +1298,7 @@ void read_action()
 
 void clean()
 {
-    for (auto& obj : object) {
+    for (auto& obj : objects) {
         for (int i = 1; i <= REP_NUM; i++) {
             if (obj.unit[i] == nullptr)
                 continue;
@@ -1147,6 +1319,8 @@ int main()
         delete_action();
         write_action();
         read_action();
+
+        // printDisks();
     }
     clean();
 
