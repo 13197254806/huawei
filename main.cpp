@@ -31,15 +31,15 @@
 // 一个读请求的最长存活时间，可以控制代码运行时间 (最大取105)
 #define MAX_ALIVE (105)
 // 期望的最小页数（不是最终的PAGE_NUM）
-#define MIN_PAGE_NUM (20)
+#define MIN_PAGE_NUM (32)
 // 期望的最大页数（不是最终的PAGE_NUM）
-#define MAX_PAGE_NUM (30)
+#define MAX_PAGE_NUM (40)
 // 权重阈值，如果当前块的权重比该值低就不读了，直接跳过
 #define WEIGHT_THRESHOULD (1 * REP_NUM)
 // 阈值gamma，当该页的剩余部分平均收益小于前面部分平均收益的gamma倍时，把该磁头的状态标记为已完成
-#define EARLY_STOP_THRESHOULD (0.1)
+#define EARLY_STOP_THRESHOULD (0.01)
 // 每个时间片都以最理想的情况读取时，限制unfinished队列大小的参数 (用于剔除在磁头读取能力之外的读请求)
-#define RESERVING_ROUNDS (50)
+#define RESERVING_ROUNDS (60)
 // 窗口尺寸，作为贪心策略的参数，决定是否要读当前对象块，或是pass (设为0时，采用自适应计算的窗口大小；非0时调参发现9附近效果最好)
 #define WINDOW_SIZE (0)
 // 随机数种子，设置为0代表使用当前系统时间
@@ -1057,12 +1057,14 @@ Page_* search_best_page(int disk_id)
         // p一定是个合法页
         Page_ *p = &pages[disk_id][i];
         if ((! p -> is_ok) || excepted_pages[p -> disk_id][p -> page_index])    continue;
-        int sum_weights = 0;
         // 选择磁头直接跳到页首，还是一格一格移过去
         int position = p == now_page? disk_point[disk_id]: p -> position;
         int end_position = p -> position + p -> page_size - 1;
         int sum_tokens = std::min(JUMP_COST, ((position - disk_point[disk_id] + V) % V) * PASS_COST);
         int tokens_origin = 1e9, tokens = 1e9;
+
+        int sum_weights = s_weights[disk_id][end_position] - s_weights[disk_id][position - 1];
+        if (sum_weights <= 0)   continue;
 
         for(int j = position; j <= end_position; j ++)
         {
@@ -1079,7 +1081,7 @@ Page_* search_best_page(int disk_id)
             {
                 last_cost = read_cost_(last_status, last_cost);
                 last_status = std::max(1, last_status + 1);
-                sum_weights += weights[disk_id][j];
+                // sum_weights += weights[disk_id][j];
             }
 
             // // 如果剩余部分价值不高，则停止扫描
@@ -1095,8 +1097,8 @@ Page_* search_best_page(int disk_id)
         // sum_weights += s_weights[disk_id][ending_position] - s_weights[disk_id][position - 1];
         sum_tokens += (tokens_origin - tokens);
         // float score = sum_weights / (static_cast<float>(sum_tokens) + 1);
-        float score = static_cast<float>(sum_weights) / static_cast<float>(sum_tokens);
-        // float score = static_cast<float>(sum_weights) / static_cast<float>(end_position - position + 1);
+        // float score = static_cast<float>(sum_weights) / static_cast<float>(sum_tokens);
+        float score = static_cast<float>(sum_weights) / static_cast<float>(end_position - position + 1);
         // float score = static_cast<float>(sum_weights);
         if (score > max_score)
         {
@@ -1108,7 +1110,9 @@ Page_* search_best_page(int disk_id)
     if (res == nullptr)
     {
         // 如果实在找不到合法的页了，那么就返回第一页去读
-        return &pages[disk_id][1];
+        // disk_point_last_done[disk_id] = true;
+        // return &pages[disk_id][1];
+        return &pages[disk_id][std::rand() % (valid_capacy[disk_id] / PAGE_SIZE) + 1];
     }
     return res;
 }
@@ -1228,14 +1232,20 @@ void do_objects_read()
             tokens = 0;
         }
 
-        if (tokens >= G / 2)
+        PageBinding_ *binding = &bindings[best_page -> disk_id][best_page -> page_index];
+        for (int rep_id = 1; rep_id <= REP_NUM; rep_id ++)
         {
-            PageBinding_ *binding = &bindings[best_page -> disk_id][best_page -> page_index];
-            for (int rep_id = 1; rep_id <= REP_NUM; rep_id ++)
-            {
-                excepted_pages[binding -> units[rep_id] -> disk_id][binding -> units[rep_id] -> page_index] = true;
-            }
+            excepted_pages[binding -> units[rep_id] -> disk_id][binding -> units[rep_id] -> page_index] = true;
         }
+
+        // if (tokens >= G / 2)
+        // {
+        //     PageBinding_ *binding = &bindings[best_page -> disk_id][best_page -> page_index];
+        //     for (int rep_id = 1; rep_id <= REP_NUM; rep_id ++)
+        //     {
+        //         excepted_pages[binding -> units[rep_id] -> disk_id][binding -> units[rep_id] -> page_index] = true;
+        //     }
+        // }
 
         // 把剩下的令牌全消耗完
         while (true)
