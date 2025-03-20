@@ -31,13 +31,13 @@
 // 一个读请求的最长存活时间，可以控制代码运行时间 (最大取105)
 #define MAX_ALIVE (105)
 // 期望的最小页数（不是最终的PAGE_NUM）
-#define MIN_PAGE_NUM (32)
+#define MIN_PAGE_NUM (16)
 // 期望的最大页数（不是最终的PAGE_NUM）
-#define MAX_PAGE_NUM (40)
+#define MAX_PAGE_NUM (16)
 // 权重阈值，如果当前块的权重比该值低就不读了，直接跳过
 #define WEIGHT_THRESHOULD (1 * REP_NUM)
 // 阈值gamma，当该页的剩余部分平均收益小于前面部分平均收益的gamma倍时，把该磁头的状态标记为已完成
-#define EARLY_STOP_THRESHOULD (0.01)
+#define EARLY_STOP_THRESHOULD (0)
 // 每个时间片都以最理想的情况读取时，限制unfinished队列大小的参数 (用于剔除在磁头读取能力之外的读请求)
 #define RESERVING_ROUNDS (60)
 // 窗口尺寸，作为贪心策略的参数，决定是否要读当前对象块，或是pass (设为0时，采用自适应计算的窗口大小；非0时调参发现9附近效果最好)
@@ -1206,30 +1206,30 @@ void do_objects_read()
         {
             // 目标页是其它页，那么先转去跳转
             disk_point_last_done[i] = false;
-            // if (JUMP_COST <= (best_page -> position - disk_point[i] + V) % V * PASS_COST)
-            // {
-            //     // 目标页太远，直接跳
-            //     disk_point[i] = best_page -> position;
-            //     disk_point_last_status[i] = -1;
-            //     disk_point_last_cost[i] = JUMP_COST;
-            //     result[i].append("j ").append(std::to_string(disk_point[i]));
-            //     tokens = 0;
-            // } else
-            // {
-            //     // 目标页比较近，可以逐步pass到目标页的开头
-            //     while (disk_point[i] != best_page -> position)
-            //     {
-            //         move_point(i, 0);
-            //         tokens -= PASS_COST;
-            //     }
-            // }
+            if (JUMP_COST <= (best_page -> position - disk_point[i] + V) % V * PASS_COST)
+            {
+                // 目标页太远，直接跳
+                disk_point[i] = best_page -> position;
+                disk_point_last_status[i] = -1;
+                disk_point_last_cost[i] = JUMP_COST;
+                result[i].append("j ").append(std::to_string(disk_point[i]));
+                tokens = 0;
+            } else
+            {
+                // 目标页比较近，可以逐步pass到目标页的开头
+                while (disk_point[i] != best_page -> position)
+                {
+                    move_point(i, 0);
+                    tokens -= PASS_COST;
+                }
+            }
 
-            // 目标页太远，直接跳
-            disk_point[i] = best_page -> position;
-            disk_point_last_status[i] = -1;
-            disk_point_last_cost[i] = JUMP_COST;
-            result[i].append("j ").append(std::to_string(disk_point[i]));
-            tokens = 0;
+            // // 目标页太远，直接跳
+            // disk_point[i] = best_page -> position;
+            // disk_point_last_status[i] = -1;
+            // disk_point_last_cost[i] = JUMP_COST;
+            // result[i].append("j ").append(std::to_string(disk_point[i]));
+            // tokens = 0;
         }
 
         PageBinding_ *binding = &bindings[best_page -> disk_id][best_page -> page_index];
@@ -1238,7 +1238,7 @@ void do_objects_read()
             excepted_pages[binding -> units[rep_id] -> disk_id][binding -> units[rep_id] -> page_index] = true;
         }
 
-        // if (tokens >= G / 2)
+        // if (tokens == 0)
         // {
         //     PageBinding_ *binding = &bindings[best_page -> disk_id][best_page -> page_index];
         //     for (int rep_id = 1; rep_id <= REP_NUM; rep_id ++)
@@ -1246,6 +1246,7 @@ void do_objects_read()
         //         excepted_pages[binding -> units[rep_id] -> disk_id][binding -> units[rep_id] -> page_index] = true;
         //     }
         // }
+
 
         // 把剩下的令牌全消耗完
         while (true)
