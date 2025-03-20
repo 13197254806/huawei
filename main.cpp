@@ -656,19 +656,17 @@ void do_object_delete(Object *obj)
 
 
     // 更新obj
+    // 只用删除一次就行了
+    PageBinding_ *binding = obj -> binding;
+    for (int j = 1; j <= obj -> size; j ++) {
+        // 更新disk
+        int pos = obj -> unit[1][j] - pages[binding -> disk_id][binding -> page_index].position + 1;
+        b_disk[binding -> b_id][pos] = 0;
+    }
+
     for (int i = 1; i <= REP_NUM; i ++)
     {
         int disk_id = obj -> replica[i];
-
-        if (i == 1)
-        {
-            // 只用删除一次就行了
-            std::pair<int, int> v = map_disks(disk_id, (obj -> unit[1][1] - 1) % PAGE_SIZE + 1);
-            for (int j = 1; j <= obj -> size; j ++) {
-                // 更新disk
-                b_disk[v.first][v.second + j - 1] = 0;
-            }
-        }
 
         // 更新pages
         Page_ *p = find_page_(disk_id, obj -> unit[i][1]);
@@ -814,7 +812,7 @@ bool object_write_(Object *obj, int disk_id)
         // 找空页
         if (st_empty[disk_id].size() > 0)
         {
-            int page_index = st_empty[disk_id].back();
+            int page_index = st_empty[disk_id].front();
             p = &pages[disk_id][page_index];
         }
     }
@@ -879,7 +877,7 @@ bool object_write_(Object *obj, int disk_id)
         q = &pages[binding -> units[rep_id] -> disk_id][binding -> units[rep_id] -> page_index];
 
         // 更新st
-        if (q -> usable_size - obj -> size == 0)
+        if (q -> page_size - q -> usable_size == obj -> size)
         {
             // 原本处于empty
             st_empty[disk_id].erase(q -> page_index);
