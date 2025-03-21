@@ -669,7 +669,8 @@ void do_object_delete(Object *obj)
         int disk_id = obj -> replica[i];
 
         // 更新pages
-        Page_ *p = find_page_(disk_id, obj -> unit[i][1]);
+        // Page_ *p = find_page_(disk_id, obj -> unit[i][1]);
+        Page_ *p = &pages[binding -> units[i] ->disk_id][binding -> units[i] ->page_index];
         int lst_max_tag = p -> max_tag;
         p -> cnt[obj -> tag] -= obj -> size;
         p -> usable_size += obj -> size;
@@ -778,7 +779,7 @@ void delete_action()
  *  写事件
  *
  */
-// 把对象obj写进磁盘disk_id，并更新存储信息和页信息（自动找到最合适的写入位置，调用函数前保证一定有足够空间）
+// 把对象obj写进磁盘disk_id，并更新存储信息和页信息（自动找到最合适的写入位置）
 bool object_write_(Object *obj, int disk_id)
 {
     /** 1. 先在当前磁盘上找到合适的写入位置，并找到这个位置绑定的其它页
@@ -858,7 +859,7 @@ bool object_write_(Object *obj, int disk_id)
                 q -> usable_size --;
 
 
-                if (q -> max_tag ==0 || q -> cnt[obj -> tag] > q -> cnt[q -> max_tag])
+                if (q -> max_tag == 0 || q -> cnt[obj -> tag] > q -> cnt[q -> max_tag])
                 {
                     // 占比最大的类型发生了变化
                     q -> max_tag = obj -> tag;
@@ -880,15 +881,15 @@ bool object_write_(Object *obj, int disk_id)
         if (q -> page_size - q -> usable_size == obj -> size)
         {
             // 原本处于empty
-            st_empty[disk_id].erase(q -> page_index);
+            st_empty[q -> disk_id].erase(q -> page_index);
             if (q -> usable_size == 0)
             {
                 // 现在为full
-                st_full[disk_id].append(q -> page_index);
+                st_full[q -> disk_id].append(q -> page_index);
             } else
             {
                 // 现在为half
-                st_half[disk_id].append(q -> page_index);
+                st_half[q -> disk_id].append(q -> page_index);
             }
         }else
         {
@@ -896,8 +897,8 @@ bool object_write_(Object *obj, int disk_id)
             if (q -> usable_size == 0)
             {
                 // 现在为full
-                st_half[disk_id].erase(q -> page_index);
-                st_full[disk_id].append(q -> page_index);
+                st_half[q -> disk_id].erase(q -> page_index);
+                st_full[q -> disk_id].append(q -> page_index);
             }
         }
     }
