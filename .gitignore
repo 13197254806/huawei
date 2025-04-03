@@ -1,7 +1,9 @@
-./cmake-build-debug
 code_craft
 main
 main.cpp -run
 main.cpp:tests
-.idea
+main.exe
+.DS_Store
 
+.idea
+cmake-build-debug
