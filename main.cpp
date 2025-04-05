@@ -50,7 +50,7 @@
 // K参数 (1 ~ 50)：每个磁头以 不超过K 个时间片为单位进行一次决策(第1个时间片移动到目的地 + 顺序读取，后续若干时间片以最小开销策略顺序读取)
 #define MAX_K (30)
 // K参数衰减系数
-#define K_DECAY (-0.003)
+#define K_DECAY (-0.002)
 // R参数 (1 ~ 50)：每个时间段起始时刻，向后看R个时间段的统计信息
 #define R (8)
 // 窗口大小 (0 ~ 20)：作为顺序读取时贪心策略的参数，在当前位置先向后看WINDOW_SIZE个块，再决定当前是read还是pass
@@ -61,7 +61,7 @@
 // 随机数种子：设置为0时调用当前系统时间作为种子
 #define RANDOM_SEED (114514)
 // 权重阈值（1 ~ INF）：如果当前块的权重小于该值就不读了，直接跳过
-#define WEIGHT_THRESHOULD (550)
+#define WEIGHT_THRESHOULD (200)
 // // 早停参数 (0 ~ 1)：当磁头累计实际读取的权重大于预期权重的 EARLY_STOP_THRESHOULD 倍时，提前结束掉当前磁头 K 轮循环的动作，释放磁头
 // #define EARLY_STOP_THRESHOULD (2)
 // 最长存活时间 (1 ~ 105)：一个读请求的最长存活时间，限制未完成请求队列的大小，剔除已过期的读请求
@@ -286,8 +286,8 @@ struct Segment
 struct CmpWrite
 {
     // 给堆用，顺序反过来
-    bool operator()(const std::pair<double, Segment>& a, const std::pair<double, Segment>& b) {
-        if (abs(a.first - b.first) <= 1e-6)
+    bool operator()(const std::pair<float, Segment>& a, const std::pair<float, Segment>& b) {
+        if (abs(a.first - b.first) < 1e-6)
         {
             if (a.second.end - a.second.start == b.second.end - b.second.start)
             {
@@ -306,8 +306,8 @@ struct CmpWrite
 struct CmpGC
 {
     // 给堆用，顺序反过来
-    bool operator()(const std::pair<double, Segment>& a, const std::pair<double, Segment>& b) {
-        if (abs(a.first - b.first) < 1e6)
+    bool operator()(const std::pair<float, Segment>& a, const std::pair<float, Segment>& b) {
+        if (abs(a.first - b.first) < 1e-6)
         {
             // 返回位置最小的
             return a.second.start > b.second.start;
@@ -363,8 +363,8 @@ int disk_tag_count[MAX_DISK_NUM][MAX_M];
 int JUMP_COST;
 // 一次PASS消耗的令牌数
 int PASS_COST;
-// 允许的最大unfinished大小，可以控制代码运行时间
-int MAX_DEQUE_SIZE;
+// // 允许的最大unfinished大小，可以控制代码运行时间
+// int MAX_DEQUE_SIZE;
 // 最大的时间段数量
 int MAX_SLICE_NUM;
 
@@ -413,10 +413,11 @@ std::vector<int> added_request_ids;
 std::vector<int> finished_request_ids;
 // 每个时间片放弃（繁忙）的请求id列表
 std::vector<int> dropped_request_ids;
-// // 每个时间片中，当前页的偏移量（防止多个磁头竞争同一页）
-// int offsets[MAX_DISK_NUM][MAX_PAGE_NUM + 1];
 // 当前时间片的磁头移动结果 (用于输出)
 std::string result[MAX_DISK_NUM][MAX_POINT_NUM];
+
+// 该时间片被读到过的对象块对应object_id
+std::vector<int> has_read;
 
 
 
@@ -428,13 +429,13 @@ std::string result[MAX_DISK_NUM][MAX_POINT_NUM];
 // 每个类的重要性权重
 // float importance[MAX_M];
 // 类i和类j在未来R个时间段内，读行为上的相似性
-double gap_read[MAX_M][MAX_M];
+float gap_read[MAX_M][MAX_M];
 // 类i和类j在未来R个时间段内，写行为上的相似性
-double gap_write[MAX_M][MAX_M];
+float gap_write[MAX_M][MAX_M];
 // 类i和类j在未来R个时间段内，删行为上的相似性
-double gap_del[MAX_M][MAX_M];
+float gap_del[MAX_M][MAX_M];
 // 类i和类j在未来R个时间段内，总体上的相似性
-double gap[MAX_M][MAX_M];
+float gap[MAX_M][MAX_M];
 // 类j在类i在未来R个时间段内，总体相似性上的排序
 int gap_rank[MAX_M][MAX_M];
 // 每个磁盘清理的结果
@@ -522,8 +523,8 @@ void init()
     // printf("page_num is:\t%d\n", PAGE_NUM);
 
 
-    // 最大的有效请求数 = 每个时间片完成读请求的能力上限 * 预留轮数
-    MAX_DEQUE_SIZE = std::max(G / 16 / 1 * N * RESERVING_ROUNDS, 1);
+    // // 最大的有效请求数 = 每个时间片完成读请求的能力上限 * 预留轮数
+    // MAX_DEQUE_SIZE = std::max(G / 16 / 1 * N * RESERVING_ROUNDS, 1);
 
     // 初始化磁头
     for (int i = 1; i <= N; i++) {
@@ -618,6 +619,7 @@ void init_per_timestamp()
     added_request_ids.clear();
     finished_request_ids.clear();
     dropped_request_ids.clear();
+    has_read.clear();
     for (int i = 1; i <= N; i ++)
     {
         for (int j = 1; j <= POINT_NUM; j ++)
@@ -661,9 +663,9 @@ void init_per_time_slice()
             {
                 // s_i += fre_read[i][s];
                 // s_j += fre_read[j][s];
-                gap_read[i][j] += (double)abs(fre_read[i][s] - fre_read[j][s]);
-                gap_write[i][j] += (double)abs(fre_write[i][s] - fre_write[j][s]);
-                gap_del[i][j] += (double)abs(fre_del[i][s] - fre_del[j][s]);
+                gap_read[i][j] += (float)abs(fre_read[i][s] - fre_read[j][s]);
+                gap_write[i][j] += (float)abs(fre_write[i][s] - fre_write[j][s]);
+                gap_del[i][j] += (float)abs(fre_del[i][s] - fre_del[j][s]);
             }
         }
     }
@@ -671,9 +673,9 @@ void init_per_time_slice()
     // 为了方便，进行归一化
     for (int i = 1; i <= M; i ++)
     {
-        double sum_read = 1;
-        double sum_write = 1;
-        double sum_del = 1;
+        float sum_read = 1;
+        float sum_write = 1;
+        float sum_del = 1;
         for (int j = 1; j <= M; j ++)
         {
             sum_read += gap_read[i][j];
@@ -886,10 +888,10 @@ int find_expected_tag(Segment &segment)
 
 
 // 计算以b为中心的局部gap_score
-double cal_gap_score(Segment &a, Segment &b, Segment &c)
+float cal_gap_score(Segment &a, Segment &b, Segment &c)
 {
     // return (a.start != 0 && a.tag != b.tag) + (b.end != PAGE_SIZE + 1 && b.tag != c.tag);
-    double res = 0;
+    float res = 0;
     if (a.start != 0)   res += gap[a.tag][b.tag];
     if (c.end != PAGE_SIZE + 1) res += gap[b.tag][c.tag];
     return res;
@@ -897,7 +899,7 @@ double cal_gap_score(Segment &a, Segment &b, Segment &c)
 
 
 // 计算将obj写入当前binding的gap_score （保证当前页一定能写进对象）
-std::pair<double, std::vector<int> > try_obj_with_binding(Object *obj, PageBinding *binding)
+std::pair<float, std::vector<int> > try_obj_with_binding(Object *obj, PageBinding *binding)
 {
     /**
      *  返回gap_score和要写入的位置
@@ -912,11 +914,11 @@ std::pair<double, std::vector<int> > try_obj_with_binding(Object *obj, PageBindi
      *          2.4 gap_score += alpha
      */
 
-    double total_profit = 0;
+    float total_profit = 0;
     int b_id = binding -> b_id;
     Page *p = &pages[binding -> disk_id][binding -> page_index];
     std::vector<Segment> segments = get_disk_segments(b_id);
-    std::priority_queue<std::pair<double, Segment>, std::vector<std::pair<double, Segment> >, CmpWrite> q;
+    std::priority_queue<std::pair<float, Segment>, std::vector<std::pair<float, Segment> >, CmpWrite> q;
     // std::priority_queue<std::pair<int, Segment>, std::vector<std::pair<int, Segment> >, CmpWrite> q;
     std::vector<int> write_positions;
 
@@ -924,20 +926,20 @@ std::pair<double, std::vector<int> > try_obj_with_binding(Object *obj, PageBindi
     {
         if (segments[i].tag != 0)    continue;
         Segment left = segments[i - 1], mid = segments[i], right = segments[i + 1];
-        double gap_before = cal_gap_score(left, mid, right);
+        float gap_before = cal_gap_score(left, mid, right);
 
         // 写入后的段
         mid.tag = obj -> tag;
 
-        double gap_after = cal_gap_score(left, mid, right);
-        double profit = gap_before - gap_after;
+        float gap_after = cal_gap_score(left, mid, right);
+        float profit = gap_before - gap_after;
         q.push(std::make_pair(profit, segments[i]));
     }
 
 
     while (! q.empty() && write_positions.size() < obj -> size)
     {
-        double profit = q.top().first;
+        float profit = q.top().first;
         Segment segment = q.top().second;
         q.pop();
 
@@ -951,11 +953,11 @@ std::pair<double, std::vector<int> > try_obj_with_binding(Object *obj, PageBindi
             Segment left = segments[idx - 1], mid = segments[idx], right = segments[idx];
             mid.end = mid.start + left_size - 1;
             right.start = mid.end + 1;
-            double gap_before = cal_gap_score(left, mid, right);
+            float gap_before = cal_gap_score(left, mid, right);
 
             mid.tag = obj -> tag;
 
-            double gap_after = cal_gap_score(left, mid, right);
+            float gap_after = cal_gap_score(left, mid, right);
             profit = gap_before - gap_after;
         }
         for (int j = 1; j <= std::min(left_size, length); j ++)
@@ -967,7 +969,7 @@ std::pair<double, std::vector<int> > try_obj_with_binding(Object *obj, PageBindi
     // 修正项：写入块和不同类型块相邻时，剩余空间大小是一个加分项
     if (total_profit < -1)
     {
-        total_profit = -100 + (total_profit) / ((p -> usable_size + 1));
+        total_profit = -10 + (total_profit) / ((float)(p -> usable_size + 1));
         // total_profit = total_profit + (total_profit) / ((p -> usable_size + 1)) + (total_profit) / ((p -> cnt[obj -> tag] + 1));
     }else if (total_profit < 0)
     {
@@ -1129,7 +1131,7 @@ void object_write_(Object *obj)
     PageBinding *binding = nullptr;
     int count_retry = 0;
     int start_b_id = std::rand() % UNIQUE_NUM + 1;
-    double max_profit = -1e9;
+    float max_profit = -1e9;
     std::vector<int> write_positions;
     while (count_retry < UNIQUE_NUM)
     {
@@ -1141,7 +1143,7 @@ void object_write_(Object *obj)
 
         // 先计算profit
         auto tmp = try_obj_with_binding(obj, now_binding);
-        double now_profit = tmp.first;
+        float now_profit = tmp.first;
         if (now_profit > max_profit)
         {
             max_profit = now_profit;
@@ -1382,7 +1384,7 @@ DiskPointSchedule search_best_position(int disk_id, int p_id)
     int res_start = 0;
     int res_end = 0;
     // 实际需要的K应当大于预估的K
-    int res_K = MAX_K + 10;
+    int res_K = MAX_K + 100;
     int max_score = 0;
     int last_status = disk_point_last_status[disk_id][p_id];
     int last_cost = disk_point_last_cost[disk_id][p_id];
@@ -1507,6 +1509,10 @@ void move_point(int disk_id, int p_id, int move_type)
         disk_point_last_status[disk_id][p_id] = std::max(1, disk_point_last_status[disk_id][p_id] + 1);
         b_visited[b_id][b_pos] ++;
         result[disk_id][p_id].append("r");
+        if (b_disk[b_id][b_pos] > 0)
+        {
+            has_read.push_back(b_disk[b_id][b_pos]);
+        }
     }
 
     disk_point[disk_id][p_id] = disk_point[disk_id][p_id] % V + 1;
@@ -1618,6 +1624,10 @@ void do_objects_read()
         // 对于同一磁盘上的多个磁头
         for (int p_id = 1; p_id <= POINT_NUM; p_id ++)
         {
+            // 前几个时间段读请求很少，只启用一个磁头就ok
+            if (p_id == 2 && now_slice <= 8)    continue;
+
+
             int tokens = G;
 
             if (disk_point_k_status[i][p_id] == 0)
@@ -1738,23 +1748,65 @@ void do_objects_read()
     }
 
 
-    // 把unfinished队列的每个请求拿出来，检查是否完成
-    for (Node_ *p = unfinished.tail -> prev; p != unfinished.head; p = p -> prev)
+    // // 把unfinished队列的每个请求拿出来，检查是否完成
+    // for (Node_ *p = unfinished.tail -> prev; p != unfinished.head; p = p -> prev)
+    // {
+    //     Request_ *r = &requests[p -> id];
+    //     if (check_request(r) == 1)
+    //     {
+    //         finished_request_ids.push_back(r -> id);
+    //     } else if (check_request(r) == -1)
+    //     {
+    //         dropped_request_ids.push_back(r -> id);
+    //     }
+    // }
+    // // 完成的请求和放弃的请求都需要拿出队列
+    // for (int request_id: finished_request_ids)
+    // {
+    //     unfinished.erase(request_id);
+    // }
+    // for (int request_id: dropped_request_ids)
+    // {
+    //     unfinished.erase(request_id);
+    // }
+
+    // 不遍历unfinished队列，只遍历可能完成的读请求
+    std::sort(has_read.begin(), has_read.end());
+    auto last_unique = std::unique(has_read.begin(), has_read.end());
+    has_read.erase(last_unique, has_read.end());
+    for (int object_id: has_read)
     {
-        Request_ *r = &requests[p -> id];
-        if (check_request(r) == 1)
-        {
-            finished_request_ids.push_back(r -> id);
-        } else if (check_request(r) == -1)
-        {
-            dropped_request_ids.push_back(r -> id);
+        Object *obj = &objects[object_id];
+        int current_id = obj -> last_request_point;
+        while (current_id != 0) {
+            if (request_deleted[current_id] || request_finished[current_id])    break;
+            Request_ *r = &requests[current_id];
+            if (unfinished.exist(current_id) && check_request(r) == 1)
+            {
+                finished_request_ids.push_back(r -> id);
+            }
+            current_id = requests[current_id].prev_id;
         }
     }
-    // 完成的请求和放弃的请求都需要拿出队列
+    // 完成的请求需要拿出队列
     for (int request_id: finished_request_ids)
     {
         unfinished.erase(request_id);
     }
+
+    // 遍历可能过期的读请求
+    for (Node_ *iter = unfinished.head -> next; iter != unfinished.tail; iter = iter -> next)
+    {
+        Request_ *r = &requests[iter -> id];
+        if (check_request(r) == -1)
+        {
+            dropped_request_ids.push_back(r -> id);
+        } else
+        {
+            break;
+        }
+    }
+    // 放弃的请求需要拿出队列
     for (int request_id: dropped_request_ids)
     {
         unfinished.erase(request_id);
@@ -1876,7 +1928,7 @@ void swap_block(PageBinding *binding, int c_1, int c_2)
 }
 
 
-void add_candidate_segments(PageBinding *binding, std::priority_queue<std::pair<double, Segment>, std::vector<std::pair<double, Segment> >, CmpGC> &q)
+void add_candidate_segments(PageBinding *binding, std::priority_queue<std::pair<float, Segment>, std::vector<std::pair<float, Segment> >, CmpGC> &q)
 {
     int b_id = binding -> b_id;
     std::vector<Segment> segments = get_disk_segments(b_id);
@@ -1890,9 +1942,9 @@ void add_candidate_segments(PageBinding *binding, std::priority_queue<std::pair<
         Segment mid = segments[i];
         mid.tag = expected_tag;
 
-        double gap_score_before = cal_gap_score(segments[i - 1], segments[i], segments[i + 1]);
-        double gap_score_after = cal_gap_score(segments[i - 1], mid, segments[i + 1]);
-        double profit = (gap_score_before - gap_score_after) / length;
+        float gap_score_before = cal_gap_score(segments[i - 1], segments[i], segments[i + 1]);
+        float gap_score_after = cal_gap_score(segments[i - 1], mid, segments[i + 1]);
+        float profit = (gap_score_before - gap_score_after) / length;
         q.push(std::make_pair(profit, segments[i]));
     }
 }
@@ -1901,7 +1953,7 @@ void add_candidate_segments(PageBinding *binding, std::priority_queue<std::pair<
 // 磁盘清理
 void do_gc()
 {
-    std::priority_queue<std::pair<double, Segment>, std::vector<std::pair<double, Segment> >, CmpGC> q;
+    std::priority_queue<std::pair<float, Segment>, std::vector<std::pair<float, Segment> >, CmpGC> q;
 
     for (int i = 1; i <= UNIQUE_NUM; i ++)
     {
