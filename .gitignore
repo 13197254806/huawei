@@ -4,6 +4,7 @@ main.cpp -run
 main.cpp:tests
 main.exe
 .DS_Store
+tmp_version.cpp
 
 .idea
 cmake-build-debug

@@ -47,21 +47,19 @@
 #define MIN_PAGE_NUM (12)
 // 期望的最大页数（1 ~ 3276 并且 >= MIN_PAGE_NUM）
 #define MAX_PAGE_NUM (12)
-// K参数 (1 ~ 50)：每个磁头以 不超过K 个时间片为单位进行一次决策(第1个时间片移动到目的地 + 顺序读取，后续若干时间片以最小开销策略顺序读取)
-#define MAX_K (30)
+// K参数 (1 ~ 256)：每个磁头以 不超过K 个时间片为单位进行一次决策(第1个时间片移动到目的地 + 顺序读取，后续若干时间片以最小开销策略顺序读取)
+#define BASE_K (40)
 // K参数衰减系数
-#define K_DECAY (-0.002)
+#define K_DECAY (-0.004)
 // R参数 (1 ~ 50)：每个时间段起始时刻，向后看R个时间段的统计信息
 #define R (8)
 // 窗口大小 (0 ~ 20)：作为顺序读取时贪心策略的参数，在当前位置先向后看WINDOW_SIZE个块，再决定当前是read还是pass
 // (设为0时，不同位置采用自适应计算的不同窗口大小)
 #define WINDOW_SIZE (0)
-// 磁盘碎片阈值(1 ~ 100): 两个同类对象块之间相隔不超过FRAG_THRETHOULD，且出现了空位置，则认为这是一个磁盘碎片
-#define FRAG_THRETHOULD (32)
 // 随机数种子：设置为0时调用当前系统时间作为种子
 #define RANDOM_SEED (114514)
 // 权重阈值（1 ~ INF）：如果当前块的权重小于该值就不读了，直接跳过
-#define WEIGHT_THRESHOULD (200)
+#define WEIGHT_THRESHOULD (3501)
 // // 早停参数 (0 ~ 1)：当磁头累计实际读取的权重大于预期权重的 EARLY_STOP_THRESHOULD 倍时，提前结束掉当前磁头 K 轮循环的动作，释放磁头
 // #define EARLY_STOP_THRESHOULD (2)
 // 最长存活时间 (1 ~ 105)：一个读请求的最长存活时间，限制未完成请求队列的大小，剔除已过期的读请求
@@ -70,6 +68,15 @@
 #define RESERVING_ROUNDS (105)
 // 可用空间修正系数，用来修正对象写入时的评分，使对象倾向于写到剩余空间大的页里
 #define SIGMA (1000.0)
+// 分割长度，当存在连续SPLIT_LENGTH个权重<WEIGHT_THRESHOULD的块时，重置当前的滑动窗口
+#define BASE_SPLIT_LENGTH (32)
+// 分割长度的变化率
+#define SPLIT_LENGTH_DECAY (0.000)
+// 分数的修正值
+#define FIX_SCORE (3500)
+// 每个读请求块每过一个时间片，损失的分数
+#define DECAY_SCORE (9.52381)
+
 
 // 读
 #define ALPHA (1)
@@ -181,7 +188,7 @@ typedef struct Deque_
         this -> cnt = 0;
     }
 
-    // 每个Deque创建完后都要
+    // 每个Deque创建完后都要初始化，分配底层数组
     void init(int size)
     {
         this -> mp = new Node_*[size + 1]();
@@ -326,6 +333,9 @@ int T, M, N, V, G, C;
 int fre_del[MAX_M][(MAX_TIME + FRE_PER_SLICING - 1) / FRE_PER_SLICING];
 int fre_write[MAX_M][(MAX_TIME + FRE_PER_SLICING - 1) / FRE_PER_SLICING];
 int fre_read[MAX_M][(MAX_TIME + FRE_PER_SLICING - 1) / FRE_PER_SLICING];
+float percent_del[MAX_M][(MAX_TIME + FRE_PER_SLICING - 1) / FRE_PER_SLICING];
+float percent_write[MAX_M][(MAX_TIME + FRE_PER_SLICING - 1) / FRE_PER_SLICING];
+float percent_read[MAX_M][(MAX_TIME + FRE_PER_SLICING - 1) / FRE_PER_SLICING];
 Request requests[MAX_REQUEST_NUM];
 Object objects[MAX_OBJECT_NUM];
 int now_time;
@@ -386,7 +396,10 @@ bool request_deleted[MAX_REQUEST_NUM];
 std::pair<int, int> b_map[MAX_DISK_NUM][MAX_DISK_SIZE];
 // 有效页b_id的锁情况 (位锁)
 int b_locks[MAX_DISK_NUM * MAX_PAGE_NUM + 1][MAX_DISK_SIZE / MIN_PAGE_NUM + 3];
-
+// 每个块上的有效读请求数，上次更新距离现在的时间片数量
+int b_dirty[MAX_DISK_NUM * MAX_PAGE_NUM + 1][MAX_DISK_SIZE / MIN_PAGE_NUM + 3];
+// 每个块上的有效读请求数量
+int b_active_num[MAX_DISK_NUM * MAX_PAGE_NUM + 1][MAX_DISK_SIZE / MIN_PAGE_NUM + 3];
 
 
 /**
@@ -395,7 +408,7 @@ int b_locks[MAX_DISK_NUM * MAX_PAGE_NUM + 1][MAX_DISK_SIZE / MIN_PAGE_NUM + 3];
  *
  */
 // 维护磁盘i中第j块的权重
-int b_weights[MAX_DISK_NUM * MAX_PAGE_NUM + 1][MAX_DISK_SIZE / MIN_PAGE_NUM + 3];
+float b_weights[MAX_DISK_NUM * MAX_PAGE_NUM + 1][MAX_DISK_SIZE / MIN_PAGE_NUM + 3];
 // // 权重的前缀和
 // int b_s_weights[MAX_DISK_NUM * MAX_PAGE_NUM + 1][MAX_DISK_SIZE / MIN_PAGE_NUM + 3];
 // // 期望的令牌消耗量前缀和
@@ -409,6 +422,8 @@ std::vector<int> deleted_object_ids;
 std::vector<int> added_object_ids;
 // 每个时间片新增的请求id列表
 std::vector<int> added_request_ids;
+// 每个时间片删除的请求id列表
+std::vector<int> deleted_request_ids;
 // 每个时间片完成的请求id列表
 std::vector<int> finished_request_ids;
 // 每个时间片放弃（繁忙）的请求id列表
@@ -456,10 +471,11 @@ int gc_m_pos[MAX_DISK_NUM * MAX_PAGE_NUM + 1][MAX_M];
 void init();
 void init_per_timestamp();
 void update_unfinished();
+void update_active(int object_id);
 Page_* find_page_(int disk_id, int position);
 int find_now_slice_();
 Page_* next_page_(Page_ *now_page);
-int time_decay(int timestamp);
+float time_decay(int current_time, int past_time);
 int read_cost_(int last_status, int last_cost);
 bool is_valid(int disk_id, int p_id);
 std::pair<int, int> map_disks_(int disk_id, int position);
@@ -609,6 +625,32 @@ void init()
         }
     }
 
+    // 计算各个时间段，个类别各种操作的占比
+    for (int s = 1; s <= MAX_SLICE_NUM; s ++)
+    {
+        int sum_del = 0, sum_write = 0, sum_read = 0;
+        for (int i = 1; i <= M; i ++)
+        {
+            sum_del += fre_del[i][s];
+            sum_write += fre_write[i][s];
+            sum_read += fre_read[i][s];
+        }
+        for (int i = 1; i <= M; i ++)
+        {
+            percent_del[i][s] = (float)fre_del[i][s] / (float)sum_del;
+            percent_write[i][s] = (float)fre_write[i][s] / (float) sum_write;
+            percent_read[i][s] = (float)fre_read[i][s] / (float) sum_read;
+        }
+    }
+    // 初始化b_dirty数组
+    for(int i = 1; i <= UNIQUE_NUM; i ++)
+    {
+        for (int j = 1; j <= PAGE_SIZE; j ++)
+        {
+            b_dirty[i][j] = 1e9;
+        }
+    }
+
 }
 
 // 每个时间片的初始化
@@ -617,6 +659,7 @@ void init_per_timestamp()
     added_object_ids.clear();
     deleted_object_ids.clear();
     added_request_ids.clear();
+    deleted_request_ids.clear();
     finished_request_ids.clear();
     dropped_request_ids.clear();
     has_read.clear();
@@ -633,10 +676,8 @@ void init_per_timestamp()
         // range_mutex[i].reset();
         for (int j = 1; j <= PAGE_SIZE; j ++)
         {
-            b_weights[i][j] = 0;
+            // b_weights[i][j] = 0;
             b_visited[i][j] = 0;
-            // b_s_weights[i][j] = 0;
-            // b_s_expected_tokens[i][j] = 0;
         }
     }
 }
@@ -741,18 +782,39 @@ void update_unfinished()
     for(int request_id: added_request_ids)
     {
         unfinished.append(request_id);
+        update_active(requests[request_id].object_id);
     }
 
     // 删除的Object绑定的Request
     for (int object_id: deleted_object_ids)
     {
+        update_active(object_id);
         int request_id = objects[object_id].last_request_point;
         while (request_id > 0)
         {
             unfinished.erase(request_id);
+
             request_id = requests[request_id].prev_id;
         }
     }
+}
+
+// 更新b_active_num
+void update_active(int object_id)
+{
+    /**
+     *  direction:
+     *      1:  新增
+     *      -1:  删除
+     */
+    Object *obj = &objects[object_id];
+    for (int i = 1; i <= obj -> size; i ++)
+    {
+        int b_id = b_map[obj -> replica[1]][obj -> unit[1][i]].first, b_pos = b_map[obj -> replica[1]][obj -> unit[1][i]].second;
+        b_dirty[b_id][b_pos] = 1e9;
+        b_active_num[b_id][b_pos] = 0;
+    }
+
 }
 
 // 返回磁盘disk_id上position对应的页
@@ -787,10 +849,13 @@ std::pair<int, int> map_disks_(int disk_id, int position)
 
 
 // 打分（int代替，乘了1000倍）
-int time_decay(int timestamp){
-    int delta = now_time - timestamp;
-    if (delta <= 10)    return -5 * delta + 1000;
-    if (delta <= 105)   return -10* delta + 1050;
+float time_decay(int current_time, int past_time){
+    float delta = (float)current_time - (float)past_time;
+    if (delta <= 10)    return -5 * delta + 1000 + FIX_SCORE;
+    if (delta <= 105)   return -10* delta + 1050 + FIX_SCORE;
+
+    // int delta = current_time - past_time;
+    // if (delta <= 105)   return - (int)(9.52381 * delta) + 1000;
     return 0;
 }
 
@@ -866,7 +931,7 @@ int find_expected_tag(Segment &segment)
      */
     int b_id = segment.b_id;
 
-    assert(segment.tag == 0);
+    // assert(segment.tag == 0);
     int left_tag = segment.start > 1? objects[b_disk[b_id][segment.start - 1]].tag: -1;
     int right_tag = segment.end < PAGE_SIZE? objects[b_disk[b_id][segment.end + 1]].tag: -1;
     assert(! (left_tag == -1 && right_tag == -1));
@@ -964,8 +1029,44 @@ std::pair<float, std::vector<int> > try_obj_with_binding(Object *obj, PageBindin
         {
             write_positions.push_back(segment.start + j - 1);
         }
+
+        // // 修正profit
+        // if (profit > 0) profit += PAGE_SIZE;
+        // else if (profit == 0)
+        // {
+        //     // profit =  profit + (profit) * 2 / (float)((length + 1));
+        //     profit = length;
+        // }else
+        // {
+        //     profit = profit + (profit) * 2 / (float)((length + 1));
+        // }
+
         total_profit += profit;
+        // total_profit += profit + (profit) * 2 / ((length + 1));
+
+
+        // if (profit < -1)
+        // {
+        //     bool flag = false;
+        //     // 新增与其它某个类型的块相邻，从空段的中间开始填
+        //     for (int j = 1; j <= std::min(left_size, length); j ++)
+        //     {
+        //         int b_pos = segment.start + (j - 1 + length / 2) % length;
+        //         if (b_pos == segment.start || b_pos == segment.end) flag = true;
+        //         write_positions.push_back(b_pos);
+        //     }
+        //     if (! flag) profit = - 2 * gap[obj -> tag][0];
+        // }else
+        // {
+        //     for (int j = 1; j <= std::min(left_size, length); j ++)
+        //     {
+        //         write_positions.push_back(segment.start + j - 1);
+        //     }
+        // }
+        // total_profit += profit;
+
     }
+
     // 修正项：写入块和不同类型块相邻时，剩余空间大小是一个加分项
     if (total_profit < -1)
     {
@@ -975,7 +1076,7 @@ std::pair<float, std::vector<int> > try_obj_with_binding(Object *obj, PageBindin
     {
         // total_profit = total_profit + (total_profit) / ((p -> usable_size + 1));
     }
-    // total_profit = total_profit + (total_profit) / ((p -> usable_size + 1));
+    // total_profit = total_profit + (total_profit) * 2 / ((p -> usable_size + 1));
 
 
     assert(write_positions.size() == obj -> size);
@@ -1059,6 +1160,7 @@ void delete_action()
         int id = _id[i];
         int current_id = objects[id].last_request_point;
         while (current_id != 0) {
+            if (request_finished[current_id] || request_deleted[current_id])    break;
             if (request_finished[current_id] == false) {
                 abort_num++;
             }
@@ -1075,6 +1177,7 @@ void delete_action()
         // 输出所有取消的请求编号，并设置标识位
         int current_id = obj -> last_request_point;
         while (current_id != 0) {
+            if (request_finished[current_id] || request_deleted[current_id])    break;
             if (request_finished[current_id] == false) {
                 printf("%d\n", current_id);
                 request_deleted[current_id] = true;
@@ -1150,8 +1253,9 @@ void object_write_(Object *obj)
             binding = now_binding;
             write_positions = tmp.second;
             // 剪枝 （profit必然 <=0）
-            if (max_profit >= 0) break;
+            // if (max_profit >= 0) break;
         }
+        // assert(now_profit <= 0);
     }
     assert(binding != nullptr);
     obj -> binding = binding;
@@ -1262,13 +1366,14 @@ void add_weights(Request *r)
         }
         // 添加贡献
         int b_pos = b_map[obj -> binding -> disk_id][obj -> unit[1][j]].second;
-        b_weights[obj -> binding -> b_id][b_pos] += time_decay(r -> timestamp);
+        b_weights[obj -> binding -> b_id][b_pos] += time_decay(now_time, r -> timestamp);
     }
 }
 
+
 // 给定状态的磁头，正位于(disk_id, position)，为了读到下一个有效块，找到下一步的最优行动方式
 // (disk_id, position)当前如果不在有效页上，则直接pass
-int best_way_to_move(int last_status, int last_cost, int disk_id, int start_position, int &tokens, bool ignore_locks=false)
+int best_way_to_move(int last_status, int last_cost, int disk_id, int start_position, int &tokens, bool ignore_locks=false, int decay_num=0)
 {
     /**
      *  策略: 当前块的读写操作，应当取决于接下来几个块（包括当前块）中，是否存在有效块。
@@ -1349,7 +1454,7 @@ int best_way_to_move(int last_status, int last_cost, int disk_id, int start_posi
         for (int now_position = start_position; now_position <= end_position; now_position ++)
         {
             int b_id = b_map[disk_id][now_position].first, b_pos = b_map[disk_id][now_position].second;
-            if (b_weights[b_id][b_pos] >= WEIGHT_THRESHOULD && ! b_locks[b_id][b_pos] && !b_visited[b_id][b_pos])
+            if (b_weights[b_id][b_pos] - decay_num * DECAY_SCORE >= WEIGHT_THRESHOULD && ! b_locks[b_id][b_pos] && !b_visited[b_id][b_pos])
             {
                 move_type = 1;
                 break;
@@ -1370,127 +1475,6 @@ int best_way_to_move(int last_status, int last_cost, int disk_id, int start_posi
     tokens -= PASS_COST;
     return 0;
 }
-
-
-// 找到磁盘disk_id上，预期收益率最大的段(起始位置 + 结束位置)
-DiskPointSchedule search_best_position(int disk_id, int p_id)
-{
-    /** 策略
-     *  1. 使用滑动窗口找到收益最高的段
-     *  2. 窗口大小 = 磁头移动到窗口开头的成本 + 这个窗口扫完的预估成本
-     *  3. 收益率 = 目标页的权重之和
-     *
-     */
-    int res_start = 0;
-    int res_end = 0;
-    // 实际需要的K应当大于预估的K
-    int res_K = MAX_K + 100;
-    int max_score = 0;
-    int last_status = disk_point_last_status[disk_id][p_id];
-    int last_cost = disk_point_last_cost[disk_id][p_id];
-    int cost_limit = G * (int)((float)MAX_K * (1 - K_DECAY * now_slice));
-    int last_read = 0;
-    // int position = 1;
-
-    // 辅助数组，记录下每个位置的花费
-    static int *pos_cost = new int[V + 1];
-
-    // 滑动窗口
-    int start = 1, end = 0;
-    int now_score = 0;
-    int now_K = 0;
-    int window_cost = 0;
-    int tokens_last = 1e9, tokens = 1e9;
-    // int now_cost = std::min(JUMP_COST, ((position - disk_point[disk_id] + V) % V) * PASS_COST);
-
-
-    while (end < valid_capacy[disk_id])
-    {
-
-        end ++;
-
-        int b_id_end = b_map[disk_id][end].first, b_pos_end = b_map[disk_id][end].second;
-        if (b_weights[b_id_end][b_pos_end] >= WEIGHT_THRESHOULD &&
-            !b_locks[b_id_end][b_pos_end] &&
-            !b_visited[b_id_end][b_pos_end]){
-            // 如果和上次读隔的距离过远，则重新初始化窗口
-            if (end - last_read > G / 1.5)
-            {
-                last_status = disk_point_last_status[disk_id][p_id];
-                last_cost = disk_point_last_cost[disk_id][p_id];
-                start = end;
-                now_score = 0;
-                window_cost = 0;
-                tokens_last = 1e9;
-                tokens = 1e9;
-            }
-
-            last_read = end;
-        }
-
-        int move_type = best_way_to_move(last_status, last_cost, disk_id, end, tokens);
-        assert(move_type >= 0);
-
-
-        last_status = move_type;
-        last_cost = (tokens_last - tokens);
-        tokens_last = tokens;
-
-        pos_cost[end] = last_cost;
-        window_cost += last_cost;
-
-        if (!b_locks[b_id_end][b_pos_end] && !b_visited[b_id_end][b_pos_end])
-        {
-            now_score += b_weights[b_id_end][b_pos_end];
-        }
-
-        // int jump_cost = std::min(JUMP_COST, ((start - disk_point[disk_id] + V) % V) * PASS_COST);
-        // int jump_cost = G;
-        // int now_cost = window_cost + jump_cost;
-
-        int b_id_start = b_map[disk_id][start].first, b_pos_start = b_map[disk_id][start].second;
-        while (start < end && (window_cost > cost_limit ||
-            b_weights[b_id_start][b_pos_start] < WEIGHT_THRESHOULD ||
-            b_locks[b_id_start][b_pos_start] ||
-            b_visited[b_id_start][b_pos_start]) )
-        {
-            // now_cost -= pos_cost[start];
-            window_cost -= pos_cost[start];
-            if (! b_locks[b_id_start][b_pos_start])
-            {
-                now_score -= b_weights[b_id_start][b_pos_start];
-            }
-            start ++;
-            b_id_start = b_map[disk_id][start].first;
-            b_pos_start = b_map[disk_id][start].second;
-        }
-
-        // 估算 K
-        now_K = (window_cost + G - 1) / G;
-
-        int tmp_start = start;
-        int tmp_end = end;
-        int tmp_now_score = now_score;
-        // 修正的令牌数
-        int additional = G - std::min((tmp_start - disk_point[disk_id][p_id] + V) % V * PASS_COST, G);
-        if (tmp_start > 0)
-        {
-            tmp_now_score += (int)((float)tmp_now_score * ((float)additional / (float)window_cost));
-        }
-
-        if (tmp_now_score > max_score)
-        {
-            max_score = tmp_now_score;
-            res_start = tmp_start;
-            res_end = tmp_end;
-            // res_K = now_K;
-        }
-    }
-
-    return DiskPointSchedule(res_start, res_end, res_K);
-}
-
-
 
 // 向前移动磁头(已经判断过剩余token足够)
 void move_point(int disk_id, int p_id, int move_type)
@@ -1560,6 +1544,390 @@ int check_request(Request *r)
 }
 
 
+
+
+// // 找到磁盘disk_id上，预期收益率最大的段(起始位置 + 结束位置 + 预期消耗的K)
+// DiskPointSchedule search_best_position(int disk_id, int p_id)
+// {
+//     /** 策略
+//      *  1. 将磁盘上的位置根据收益分区段，读完每个区段的花费不应当超过 MAX_K 个时间片
+//      *  2. 遍历各个区段的平均收益，找到收益最大的那一个并返回
+//      */
+//
+//     // // 辅助数组，记录下每个位置的花费
+//     // static int *pos_cost = new int[V + 1];
+//
+//     // 按衰减率计算出当前允许的最大K
+//     int MAX_K = (int)((float)BASE_K * (1 - K_DECAY * now_slice));
+//     int SPLIT_LENGTH = (int)((float)BASE_SPLIT_LENGTH * (1 - SPLIT_LENGTH_DECAY * now_slice));
+//     DiskPointSchedule res(disk_point[disk_id][p_id], disk_point[disk_id][p_id], 1);
+//     // DiskPointSchedule res(1, 1, 1);
+//     // 记录最大的收益率
+//     float max_profit = -1e9;
+//
+//     int count_read = 0;
+//     // 用 (last_l, last_r) 记录一个可读的区段
+//     int last_l = -1, last_r = -1;
+//     for (int r = 1; r <= valid_capacy[disk_id] + 1; r ++)
+//     {
+//         // 如果当前扫完磁盘，或者距离上次的隔断数超过SPLIT_LENGTH，则把(last_l, last_r)视为一个可处理的区段，计算其收益
+//         if ((r == valid_capacy[disk_id] + 1 || r - last_r >= SPLIT_LENGTH) && last_l != -1)
+//         {
+//             // 初始化磁头状态，计算 (last_l, last_r) 的收益
+//             int last_status = disk_point_last_status[disk_id][p_id];
+//             int last_cost = disk_point_last_cost[disk_id][p_id];
+//             int point = disk_point[disk_id][p_id];
+//             float now_profit = 0;
+//             int tokens = G;
+//             int cost_K = 0;
+//
+//             // 先将磁头移动到 last_l, 重新调整磁头当前状态和令牌数
+//             int distance = (last_l - point + V) % V;
+//             if (JUMP_COST <= distance * PASS_COST)
+//             {
+//                 // 目标位置太远，则选择JUMP
+//                 last_status = -1;
+//                 last_cost = 64;
+//                 point = last_l;
+//                 tokens = 0;
+//             } else
+//             {
+//                 // 目标位置比较近，磁头可以PASS到相应位置
+//                 last_status = 0;
+//                 last_cost = PASS_COST;
+//                 point = last_l;
+//                 tokens -= distance * PASS_COST;
+//             }
+//
+//             // 开始计算最大K个时间片窗口内的收益
+//             for (int i = 1; i <= MAX_K && point <= last_r; i ++)
+//             {
+//                 float tmp_profit = 0;
+//                 // 相较于起始点，当前所在时间片的偏移量
+//                 int decay_num = i - 1;
+//                 // int decay_num = 0;
+//                 // 每个K单独计算收益，涉及到时间衰减
+//                 while (point <= last_r)
+//                 {
+//                     int b_id = b_map[disk_id][point].first, b_pos = b_map[disk_id][point].second;
+//
+//                     int last_tokens = tokens;
+//                     int move_type = best_way_to_move(
+//                         last_status,
+//                         last_cost,
+//                         disk_id,
+//                         point,
+//                         tokens,
+//                         false,
+//                         decay_num);
+//
+//                     if (move_type == 0)
+//                     {
+//                         // 当前需要PASS
+//                         last_status = 0;
+//                         last_cost = PASS_COST;
+//                         point ++;
+//                     }else if (move_type == 1)
+//                     {
+//                         // 当前需要READ
+//                         last_status = 1;
+//                         last_cost = last_tokens - tokens;
+//                         point ++;
+//
+//                         // float fixed_weight = b_weights[b_id][b_pos] - (float)(decay_num * DECAY_SCORE * b_active_num[b_id][b_pos]);
+//                         // float fixed_weight = b_weights[b_id][b_pos] - (float)(decay_num * DECAY_SCORE);
+//                         float fixed_weight = b_weights[b_id][b_pos];
+//                         // if (b_disk[b_id][b_pos] > 0 && !)
+//
+//                         // if (fixed_weight - FIX_SCORE < decay_num * DECAY_SCORE)
+//                         // if (fixed_weight - FIX_SCORE <= 1)
+//                         // {
+//                         //     // 读到当前块时，该块已经过期
+//                         //     fixed_weight = 0;
+//                         //     last_status = 0;
+//                         //     tokens = last_tokens - 1;
+//                         //     last_cost = PASS_COST;
+//                         //
+//                         // }
+//                         tmp_profit += fixed_weight;
+//                         now_profit += fixed_weight;
+//                         // now_profit += b_weights[b_id][b_pos];
+//
+//                     }else
+//                     {
+//                         // 令牌不够接着移动了，停下即可
+//                         break;
+//                     }
+//                 }
+//                 // TODO: 早停止策略，当前这个时间段取得的总收益太少则停止
+//                 // if (tmp_profit <= 0)
+//                 // {
+//                 //     // r = std::min(point + 1, valid_capacy[disk_id]);
+//                 //     break;
+//                 // }
+//
+//                 cost_K = i;
+//                 // 刷新下一轮的令牌数
+//                 tokens = G;
+//             }
+//             // 更新最大收益
+//             now_profit /= (float)cost_K;
+//             if (now_profit > max_profit)
+//             {
+//                 max_profit = now_profit;
+//                 res.start = last_l;
+//                 res.end = std::min(point, valid_capacy[disk_id]);
+//                 res.K = MAX_K + 1;
+//                 // res.K = cost_K + 1;
+//             }
+//
+//             // 重置窗口(last_l, last_r)
+//             last_l = -1;
+//             last_r = -1;
+//             count_read = 0;
+//         }
+//
+//         // 先映射到 (b_id, b_pos)
+//         int b_id_r = b_map[disk_id][r].first, b_pos_r = b_map[disk_id][r].second;
+//
+//         if (b_weights[b_id_r][b_pos_r] >= WEIGHT_THRESHOULD &&
+//             !b_locks[b_id_r][b_pos_r] &&
+//             !b_visited[b_id_r][b_pos_r]){
+//             // 如果当前位置可读，那么需要更新(last_l, last_r)
+//             if (last_l == -1)
+//             {
+//                 // 如果是第一个可读块，还需要更新last_l
+//                 last_l = r;
+//             }
+//             last_r = r;
+//             count_read ++;
+//         }
+//     }
+//
+//     return res;
+// }
+
+
+
+// 找到磁盘disk_id上，预期收益率最大的段(起始位置 + 结束位置 + 预期消耗的K)
+DiskPointSchedule search_best_position(int disk_id, int p_id)
+{
+    /** 策略
+     *  1. 将磁盘上的位置根据收益分区段，读完每个区段的花费不应当超过 MAX_K 个时间片
+     *  2. 遍历各个区段的平均收益，找到收益最大的那一个并返回
+     */
+
+    // // 辅助数组，记录下每个位置的花费
+    // static int *pos_cost = new int[V + 1];
+
+    // 按衰减率计算出当前允许的最大K
+    int MAX_K = (int)((float)BASE_K * (1 - K_DECAY * now_slice));
+    int SPLIT_LENGTH = (int)((float)BASE_SPLIT_LENGTH * (1 - SPLIT_LENGTH_DECAY * now_slice));
+    DiskPointSchedule res(disk_point[disk_id][p_id], disk_point[disk_id][p_id], 1);
+    // DiskPointSchedule res(1, 1, 1);
+
+    // 记录最大的收益率
+    float max_profit = -1e9;
+    // 初始化磁头状态，计算 (last_l, last_r) 的收益
+    int last_status = disk_point_last_status[disk_id][p_id];
+    int last_cost = disk_point_last_cost[disk_id][p_id];
+    int point = disk_point[disk_id][p_id];
+    float now_profit = 0;
+    int tokens = G;
+    int cost_K = 1;
+    bool is_scanning = false;
+    int last_l = -1, last_r = -1;
+
+
+    for (int r = 1; r <= valid_capacy[disk_id]; r ++)
+    {
+        // 先映射到 (b_id, b_pos)
+        int b_id = b_map[disk_id][r].first, b_pos = b_map[disk_id][r].second;
+
+        // 判断是否需要刷新当前窗口
+        if (b_weights[b_id][b_pos] >= WEIGHT_THRESHOULD &&
+            !b_locks[b_id][b_pos] &&
+            !b_visited[b_id][b_pos] &&
+            !is_scanning)
+            {
+
+            // 如果是第一个可读块，则先刷新当前窗口
+            last_status = disk_point_last_status[disk_id][p_id];
+            last_cost = disk_point_last_cost[disk_id][p_id];
+            point = disk_point[disk_id][p_id];
+            now_profit = 0;
+            tokens = G;
+            cost_K = 1;
+            is_scanning = true;
+            last_l = r;
+
+            // 先将磁头移动到 r, 重新调整磁头当前状态和令牌数
+            int distance = (r - point + V) % V;
+            if (JUMP_COST <= distance * PASS_COST)
+            {
+                // 目标位置太远，则选择JUMP
+                last_status = -1;
+                last_cost = 64;
+                point = r;
+                tokens = 0;
+            } else if (distance > 0)
+            {
+
+                // 目标页比较近，磁头自行决定怎么移到目标页的开头收益最大
+                // while (distance >= 1)
+                // {
+                //     // 能先读就先读
+                //     int last_tokens = tokens;
+                //     int move_type = best_way_to_move(last_status,
+                //         last_cost,
+                //         disk_id,
+                //         point,
+                //         tokens,
+                //         false,
+                //         0);
+                //
+                //     if (move_type != -1 && (distance - 1) * PASS_COST > tokens)
+                //     {
+                //         // 这一步不能再走了，应当回溯
+                //         tokens = last_tokens;
+                //         break;
+                //     }
+                //     if (move_type == -1)
+                //     {
+                //         break;
+                //     }
+                //
+                //     last_cost = last_tokens - tokens;
+                //     last_status = move_type;
+                //
+                //     point = point % V + 1;
+                //     distance = (r - point + V) % V;
+                // }
+                while (point != r)
+                {
+                    tokens -= PASS_COST;
+                    point = point % V + 1;
+                    last_cost = PASS_COST;
+                    last_status = 0;
+                }
+
+
+                // // 目标位置比较近，磁头可以一直PASS到相应位置
+                // last_status = 0;
+                // last_cost = PASS_COST;
+                // point = r;
+                // tokens -= distance * PASS_COST;
+            }
+        }
+
+
+        if (is_scanning)
+        {
+            // 如果当前处于扫描状态，那么移动磁头就好
+            int last_tokens = tokens;
+            int move_type = best_way_to_move(
+                last_status,
+                last_cost,
+                disk_id,
+                point,
+                tokens,
+                false,
+                cost_K - 1);
+
+            if (move_type == -1)
+            {
+                // 令牌数不够此次移动了
+                if (cost_K < MAX_K)
+                {
+                    // 如果还没超过最大时间片数量，则新开一个时间片，并且重新尝试移动
+                    cost_K ++;
+                    tokens = G;
+                    last_tokens = tokens;
+
+                    move_type = best_way_to_move(
+                        last_status,
+                        last_cost,
+                        disk_id,
+                        point,
+                        tokens,
+                        false,
+                        cost_K - 1);
+                } else
+                {
+                    // 如果超过了，则计算收益，并重置窗口
+                    now_profit /= (float)cost_K;
+                    assert(last_l != -1);
+                    if (now_profit > max_profit)
+                    {
+                        max_profit = now_profit;
+                        res.start = last_l;
+                        res.end = std::min(point, valid_capacy[disk_id]);
+                        res.K = MAX_K + 1;
+                        // res.K = cost_K + 1;
+                    }
+
+                    is_scanning = false;
+                    last_l = -1;
+                    last_r = -1;
+
+                    r --;
+                    continue;
+                }
+            }
+
+            assert(move_type >= 0);
+            if (move_type == 0)
+            {
+                // 当前需要PASS
+                last_status = 0;
+                last_cost = PASS_COST;
+                point ++;
+            }else
+            {
+                // 当前需要READ
+                last_r = r;
+                last_status = 1;
+                last_cost = last_tokens - tokens;
+                point ++;
+
+                float fixed_weight = b_weights[b_id][b_pos];
+                // float fixed_weight = b_weights[b_id][b_pos] - (float)((cost_K - 1) * DECAY_SCORE);
+
+                now_profit += fixed_weight;
+            }
+        } else
+        {
+            // 当前并不处于扫描状态
+        }
+
+        // 如果当前距离上次读距离过远，则初始化窗口
+        if (is_scanning && (r == valid_capacy[disk_id] || (r - last_r) >= SPLIT_LENGTH))
+        {
+            // 如果超过了，则计算收益，并重置窗口
+            now_profit /= (float)cost_K;
+            if (now_profit > max_profit)
+            {
+                max_profit = now_profit;
+                res.start = last_l;
+                // res.end = std::min(point, valid_capacy[disk_id]);
+                res.end = std::min(last_r, valid_capacy[disk_id]);
+                res.K = MAX_K + 1;
+                // res.K = cost_K + 1;
+            }
+
+            is_scanning = false;
+            last_l = -1;
+            last_r = -1;
+        }
+
+    }
+
+    return res;
+}
+
+
+
+
 // 1个时间片内，移动所有磁头，返回已完成的请求列表
 void do_objects_read()
 {
@@ -1573,45 +1941,57 @@ void do_objects_read()
      *  6. 统计读取结果
      */
 
-    // 遍历每个已有请求，贡献权重
-    for (Node_ *p = unfinished.head ->next; p != unfinished.tail; p = p -> next)
-    {
-        add_weights(&requests[p -> id]);
-    }
-    // 维护权重的前缀和，维护指针跳转的开销
+    // // 遍历式更新b_weights
+    // for (Node_ *p = unfinished.head ->next; p != unfinished.tail; p = p -> next)
+    // {
+    //     add_weights(&requests[p -> id]);
+    // }
+
+    // 增量式更新b_weights
     for (int i = 1; i <= UNIQUE_NUM; i ++)
     {
-        // 假定每个有效页的起始位置状态为0或-1，先模拟走完这一页算出开销
-        // PageBinding_ *binding = unique_bindings[i];
-        // int last_status = -1;
-        // int last_cost = 0;
-        // int disk_id = binding -> disk_id;
-        // int position = pages[binding -> disk_id][binding -> page_index].position;
-        // int last_tokens = 1e9, tokens = 1e9;
+        for (int j = 1; j <= PAGE_SIZE; j ++)
+        {
+            if (b_disk[i][j] == 0)
+            {
+                b_weights[i][j] = 0;
+                continue;
+            }
 
-        // bool ignore = true;
-        // for (int j = 1; j <= REP_NUM; j ++)
-        // {
-        //     int rep_disk_id = unique_bindings[i] -> units[j] -> disk_id;
-        //     if (disk_point_k_status[rep_disk_id] <= 1)
-        //     {
-        //         ignore = false;
-        //         break;
-        //     }
-        // }
-        // if (ignore) continue;
-        // for (int j = 1; j <= PAGE_SIZE; j ++)
-        // {
-        //     b_s_weights[i][j] = b_s_weights[i][j - 1] + (b_weights[i][j] >= WEIGHT_THRESHOULD? b_weights[i][j]: 0);
-        //     // int move_type = best_way_to_move(last_status, last_cost, disk_id, position, tokens, true);
-        //     // assert(move_type >= 0);
-        //     //
-        //     // last_cost = last_tokens - tokens;
-        //     // b_s_expected_tokens[i][j] = b_s_expected_tokens[i][j - 1] + last_cost;
-        //     // last_tokens = tokens;
-        //     // last_status = move_type;
-        // }
+            if (b_dirty[i][j] <= 104)
+            {
+                b_weights[i][j] -= (float)9.52381 * (float)b_active_num[i][j];
+                b_dirty[i][j] ++;
+            }else
+            {
+                b_weights[i][j] = 0;
+                b_dirty[i][j] = 0;
+                b_active_num[i][j] = 0;
+
+                Object *obj = &objects[b_disk[i][j]];
+                int current_id = obj -> last_request_point;
+                while (current_id != 0) {
+                    Request *r = &requests[current_id];
+                    if (request_finished[current_id] || request_deleted[current_id])    break;
+
+                    int idx = 1;
+                    while(true)
+                    {
+                        int b_pos = b_map[obj -> replica[1]][obj -> unit[1][idx]].second;
+                        if (b_pos == j) break;
+                        idx ++;
+                    }
+                    if (! r -> block_status.test(idx))
+                    {
+                        b_weights[i][j] += time_decay(now_time, r -> timestamp);
+                        b_active_num[i][j] ++;
+                    }
+                    current_id = requests[current_id].prev_id;
+                }
+            }
+        }
     }
+
 
     // 移动各个磁头
     for (int i = 1; i <= N; i ++)
@@ -1624,10 +2004,6 @@ void do_objects_read()
         // 对于同一磁盘上的多个磁头
         for (int p_id = 1; p_id <= POINT_NUM; p_id ++)
         {
-            // 前几个时间段读请求很少，只启用一个磁头就ok
-            if (p_id == 2 && now_slice <= 8)    continue;
-
-
             int tokens = G;
 
             if (disk_point_k_status[i][p_id] == 0)
@@ -1655,8 +2031,7 @@ void do_objects_read()
                 DiskPointSchedule schedule = search_best_position(i, p_id);
                 disk_point_start[i][p_id] = schedule.start;
                 disk_point_end[i][p_id] = schedule.end;
-                disk_point_k_status[i][p_id] = (int)((float)schedule.K * (1 - K_DECAY * now_slice));
-                // disk_point_k_status[i] = (int)((float)K * (1 - K_DECAY * now_slice));
+                disk_point_k_status[i][p_id] = schedule.K;
 
                 // 如果当前磁盘没有需要读的对象块，则把状态置0
                 if (disk_point_start[i][p_id] == 0 || disk_point_end[i][p_id] == 0)
@@ -1693,16 +2068,39 @@ void do_objects_read()
                 } else
                 {
                     // 目标页比较近，磁头自行决定怎么移到目标页的开头收益最大
-                    while (distance >= 1 && distance * JUMP_COST <= tokens)
-                    {
-                        // 能先读就先读
-                        int move_type = best_way_to_move(disk_point_last_status[i][p_id],
-                            disk_point_last_cost[i][p_id],
-                            i, disk_point[i][p_id],
-                            tokens, true);
-                        move_point(i, p_id, move_type);
-                        distance = (disk_point_start[i][p_id] - disk_point[i][p_id] + V) % V;
-                    }
+
+                    // while (distance >= 1)
+                    // {
+                    //
+                    //     // 能先读就先读
+                    //     int last_tokens = tokens;
+                    //     int move_type = best_way_to_move(disk_point_last_status[i][p_id],
+                    //         disk_point_last_cost[i][p_id],
+                    //         i,
+                    //         disk_point[i][p_id],
+                    //         tokens,
+                    //         true,
+                    //         0);
+                    //
+                    //     if (move_type != -1 && (distance - 1) * PASS_COST > tokens)
+                    //     {
+                    //         // 这一步不能再走了，应当回溯
+                    //         tokens = last_tokens;
+                    //         break;
+                    //     }
+                    //     if (move_type == -1)
+                    //     {
+                    //         break;
+                    //     }
+                    //
+                    //
+                    //     // int move_type = best_way_to_move(disk_point_last_status[i][p_id],
+                    //     //     disk_point_last_cost[i][p_id],
+                    //     //     i, disk_point[i][p_id],
+                    //     //     tokens, true);
+                    //     move_point(i, p_id, move_type);
+                    //     distance = (disk_point_start[i][p_id] - disk_point[i][p_id] + V) % V;
+                    // }
                     while (disk_point[i][p_id] != disk_point_start[i][p_id])
                     {
                         move_point(i, p_id, 0);
@@ -1725,13 +2123,6 @@ void do_objects_read()
                     i, disk_point[i][p_id], tokens, true);
                 if (move_type != -1)
                 {
-                    // if (disk_point_start[i] < disk_point_end[i] && is_disk_point_in_lock(i))
-                    // {
-                    //     assert(disk_point_start[i] == disk_point[i]);
-                    //     int b_id = b_map[i][disk_point[i]].first, b_pos = b_map[i][disk_point[i]].second;
-                    //     b_locks[b_id][b_pos] --;
-                    //     disk_point_start[i] = disk_point_start[i] % V + 1;
-                    // }
                     move_point(i, p_id, move_type);
                     if (! is_disk_point_in_lock(i, p_id))
                     {
@@ -1743,32 +2134,8 @@ void do_objects_read()
                 }
             }
         }
-
-
     }
 
-
-    // // 把unfinished队列的每个请求拿出来，检查是否完成
-    // for (Node_ *p = unfinished.tail -> prev; p != unfinished.head; p = p -> prev)
-    // {
-    //     Request_ *r = &requests[p -> id];
-    //     if (check_request(r) == 1)
-    //     {
-    //         finished_request_ids.push_back(r -> id);
-    //     } else if (check_request(r) == -1)
-    //     {
-    //         dropped_request_ids.push_back(r -> id);
-    //     }
-    // }
-    // // 完成的请求和放弃的请求都需要拿出队列
-    // for (int request_id: finished_request_ids)
-    // {
-    //     unfinished.erase(request_id);
-    // }
-    // for (int request_id: dropped_request_ids)
-    // {
-    //     unfinished.erase(request_id);
-    // }
 
     // 不遍历unfinished队列，只遍历可能完成的读请求
     std::sort(has_read.begin(), has_read.end());
@@ -1778,6 +2145,8 @@ void do_objects_read()
     {
         Object *obj = &objects[object_id];
         int current_id = obj -> last_request_point;
+        update_active(obj -> id);
+
         while (current_id != 0) {
             if (request_deleted[current_id] || request_finished[current_id])    break;
             Request_ *r = &requests[current_id];
@@ -1810,6 +2179,7 @@ void do_objects_read()
     for (int request_id: dropped_request_ids)
     {
         unfinished.erase(request_id);
+        update_active(requests[request_id].object_id);
     }
 }
 
@@ -1937,6 +2307,7 @@ void add_candidate_segments(PageBinding *binding, std::priority_queue<std::pair<
     {
         int length = segments[i].end - segments[i].start + 1;
         if (segments[i].tag != 0 || length >= 5)   continue;
+        // if (length >= 5)   continue;
         int expected_tag = find_expected_tag(segments[i]);
         if (expected_tag <= 0)  continue;
         Segment mid = segments[i];
@@ -1944,7 +2315,10 @@ void add_candidate_segments(PageBinding *binding, std::priority_queue<std::pair<
 
         float gap_score_before = cal_gap_score(segments[i - 1], segments[i], segments[i + 1]);
         float gap_score_after = cal_gap_score(segments[i - 1], mid, segments[i + 1]);
-        float profit = (gap_score_before - gap_score_after) / length;
+        // float profit = (gap_score_before - gap_score_after) / (float)length;
+        float profit = (gap_score_before - gap_score_after);
+        // profit = profit * 100 * (1 - percent_write[expected_tag][now_slice + 1]);
+        // profit = profit * 100 * (2 + percent_write[expected_tag][now_slice + 1]);
         q.push(std::make_pair(profit, segments[i]));
     }
 }
@@ -1997,7 +2371,7 @@ void do_gc()
             continue;
         }
 
-
+        int tmp = gc_m_pos[b_id][expected_tag];
         for (int j = 1; j <= length; j ++)
         {
             while (true)
@@ -2007,7 +2381,7 @@ void do_gc()
                 gc_m_pos[b_id][expected_tag] --;
             }
             int b_pos = gc_m_pos[b_id][expected_tag];
-            if (b_pos > 0 && get_tag(b_id, b_pos) == expected_tag && !gc_visited[b_id][b_pos])
+            if (b_pos > 0 && b_pos > segment.end && get_tag(b_id, b_pos) == expected_tag && !gc_visited[b_id][b_pos])
             {
                 swap_positions.push_back(b_pos);
                 gc_m_pos[b_id][expected_tag] --;
@@ -2022,6 +2396,9 @@ void do_gc()
                 gc_visited[b_id][swap_positions[j - 1]] = 1;
             }
             total_cost += length * REP_NUM;
+        }else
+        {
+            gc_m_pos[b_id][expected_tag] = tmp;
         }
     }
 }
